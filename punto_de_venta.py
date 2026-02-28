@@ -50,6 +50,7 @@ def init_db():
                 codigo    TEXT    UNIQUE NOT NULL,
                 nombre    TEXT    NOT NULL,
                 precio    REAL    NOT NULL DEFAULT 0,
+                costo     REAL    NOT NULL DEFAULT 0,
                 stock     INTEGER NOT NULL DEFAULT 0,
                 categoria TEXT    DEFAULT 'General'
             );
@@ -66,22 +67,34 @@ def init_db():
                 producto_id INTEGER NOT NULL,
                 nombre      TEXT    NOT NULL,
                 precio      REAL    NOT NULL,
+                costo       REAL    NOT NULL DEFAULT 0,
                 cantidad    INTEGER NOT NULL,
                 subtotal    REAL    NOT NULL,
+                ganancia    REAL    NOT NULL DEFAULT 0,
                 FOREIGN KEY (venta_id)    REFERENCES ventas(id),
                 FOREIGN KEY (producto_id) REFERENCES productos(id)
             );
         """)
+        # Migración: agregar columnas a BD existente sin perder datos
+        for sql in [
+            "ALTER TABLE productos ADD COLUMN costo REAL NOT NULL DEFAULT 0",
+            "ALTER TABLE detalle_venta ADD COLUMN costo REAL NOT NULL DEFAULT 0",
+            "ALTER TABLE detalle_venta ADD COLUMN ganancia REAL NOT NULL DEFAULT 0",
+        ]:
+            try:
+                conn.execute(sql)
+            except Exception:
+                pass  # La columna ya existe — ignorar
         cur = conn.execute("SELECT COUNT(*) FROM productos")
         if cur.fetchone()[0] == 0:
             conn.executemany(
-                "INSERT INTO productos (codigo,nombre,precio,stock,categoria) VALUES (?,?,?,?,?)",
+                "INSERT INTO productos (codigo,nombre,precio,costo,stock,categoria) VALUES (?,?,?,?,?,?)",
                 [
-                    ("P001", "Refresco 600ml",  18.0, 50, "Bebidas"),
-                    ("P002", "Agua 500ml",       10.0, 80, "Bebidas"),
-                    ("P003", "Papas fritas",     15.0, 30, "Botanas"),
-                    ("P004", "Galletas",         12.0, 40, "Botanas"),
-                    ("P005", "Café americano",   25.0, 20, "Cafetería"),
+                    ("P001", "Refresco 600ml",  18.0, 12.0, 50, "Bebidas"),
+                    ("P002", "Agua 500ml",       10.0,  6.0, 80, "Bebidas"),
+                    ("P003", "Papas fritas",     15.0,  9.0, 30, "Botanas"),
+                    ("P004", "Galletas",         12.0,  7.0, 40, "Botanas"),
+                    ("P005", "Café americano",   25.0, 14.0, 20, "Cafetería"),
                 ]
             )
 
@@ -301,7 +314,7 @@ class PuntoDeVenta(tk.Tk):
         self._productos_cache = []
         with get_conn() as conn:
             rows = conn.execute(
-                "SELECT id,codigo,nombre,precio,stock FROM productos ORDER BY nombre"
+                "SELECT id,codigo,nombre,precio,costo,stock FROM productos ORDER BY nombre"
             ).fetchall()
         self._productos_cache = rows
         self._filtrar_productos()
@@ -311,7 +324,7 @@ class PuntoDeVenta(tk.Tk):
         for row in self.tabla_busq.get_children():
             self.tabla_busq.delete(row)
         for prod in self._productos_cache:
-            pid, codigo, nombre, precio, stock = prod
+            pid, codigo, nombre, precio, costo, stock = prod
             if q in codigo.lower() or q in nombre.lower():
                 tag = "low" if stock <= 5 else ""
                 self.tabla_busq.insert("", "end",
@@ -341,7 +354,7 @@ class PuntoDeVenta(tk.Tk):
         prod = next((p for p in self._productos_cache if p[0] == pid), None)
         if not prod:
             return
-        pid, codigo, nombre, precio, stock = prod
+        pid, codigo, nombre, precio, costo, stock = prod
         if stock <= 0:
             messagebox.showwarning("Sin stock",
                 f'"{nombre}" no tiene stock disponible.', parent=self)
@@ -357,7 +370,8 @@ class PuntoDeVenta(tk.Tk):
                 self.sv_busqueda.set("")
                 return
         self.carrito.append({"id": pid, "codigo": codigo, "nombre": nombre,
-                              "precio": precio, "cantidad": 1, "stock": stock})
+                              "precio": precio, "costo": costo,
+                              "cantidad": 1, "stock": stock})
         self._refresh_carrito()
         self.sv_busqueda.set("")
 
@@ -407,12 +421,14 @@ class PuntoDeVenta(tk.Tk):
                                (fecha, total))
             venta_id = cur.lastrowid
             for item in self.carrito:
-                sub = item["precio"] * item["cantidad"]
+                sub      = item["precio"] * item["cantidad"]
+                ganancia = (item["precio"] - item["costo"]) * item["cantidad"]
                 conn.execute(
-                    "INSERT INTO detalle_venta (venta_id,producto_id,nombre,precio,cantidad,subtotal)"
-                    " VALUES (?,?,?,?,?,?)",
+                    "INSERT INTO detalle_venta"
+                    " (venta_id,producto_id,nombre,precio,costo,cantidad,subtotal,ganancia)"
+                    " VALUES (?,?,?,?,?,?,?,?)",
                     (venta_id, item["id"], item["nombre"],
-                     item["precio"], item["cantidad"], sub))
+                     item["precio"], item["costo"], item["cantidad"], sub, ganancia))
                 conn.execute("UPDATE productos SET stock = stock - ? WHERE id = ?",
                              (item["cantidad"], item["id"]))
         messagebox.showinfo("✔ Venta registrada",
@@ -436,22 +452,23 @@ class PuntoDeVenta(tk.Tk):
                      row=0, column=0, columnspan=6, sticky="w", pady=(0,10))
 
         fields = [("Código", "e_codigo"), ("Nombre", "e_nombre"),
-                  ("Precio $", "e_precio"), ("Stock", "e_stock"),
-                  ("Categoría", "e_categoria")]
+                  ("Costo $", "e_costo"), ("Precio venta $", "e_precio"),
+                  ("Stock", "e_stock"), ("Categoría", "e_categoria")]
         self._prod_entries = {}
         for col, (lbl, key) in enumerate(fields):
-            tk.Label(form_card, text=lbl, fg=C["muted"], bg=C["card"],
+            tk.Label(form_card, text=lbl, fg=C["muted"] if key != "e_costo" else C["yellow"],
+                     bg=C["card"],
                      font=("Courier", 9)).grid(row=1, column=col, padx=(0,4), sticky="w")
             ent = tk.Entry(form_card, bg=C["panel"], fg=C["text"],
                            insertbackground=C["text"], bd=0, font=("Courier", 11),
                            highlightbackground=C["border"], highlightthickness=1,
-                           width=14)
+                           width=12)
             ent.grid(row=2, column=col, padx=(0,8), ipady=6, sticky="ew")
             self._prod_entries[key] = ent
         form_card.columnconfigure(1, weight=1)
 
         btn_frame = tk.Frame(form_card, bg=C["card"])
-        btn_frame.grid(row=2, column=5, padx=(8,0), sticky="e")
+        btn_frame.grid(row=2, column=6, padx=(8,0), sticky="e")
 
         tk.Button(btn_frame, text="＋ Guardar", bg=C["accent"], fg=C["white"],
                   bd=0, font=("Courier", 10, "bold"), padx=12, pady=6, cursor="hand2",
@@ -460,9 +477,9 @@ class PuntoDeVenta(tk.Tk):
                   bd=0, font=("Courier", 10), padx=12, pady=6, cursor="hand2",
                   command=self._eliminar_producto).pack(side="left")
 
-        cols = ("id","codigo","nombre","precio","stock","categoria")
-        heads = ("ID","Código","Nombre","Precio","Stock","Categoría")
-        widths = [40,90,220,80,70,100]
+        cols = ("id","codigo","nombre","costo","precio","stock","categoria")
+        heads = ("ID","Código","Nombre","Costo","Precio venta","Stock","Categoría")
+        widths = [40,80,190,70,80,60,90]
 
         frame_t = tk.Frame(page, bg=C["bg"])
         frame_t.pack(fill="both", expand=True)
@@ -505,13 +522,13 @@ class PuntoDeVenta(tk.Tk):
             self.tabla_prod.delete(row)
         with get_conn() as conn:
             rows = conn.execute(
-                "SELECT id,codigo,nombre,precio,stock,categoria FROM productos ORDER BY nombre"
+                "SELECT id,codigo,nombre,costo,precio,stock,categoria FROM productos ORDER BY nombre"
             ).fetchall()
         for r in rows:
             if q in r[1].lower() or q in r[2].lower():
-                tag = "low" if r[4] <= 5 else ""
+                tag = "low" if r[5] <= 5 else ""
                 self.tabla_prod.insert("", "end",
-                    values=(r[0],r[1],r[2],f"${r[3]:.2f}",r[4],r[5]),
+                    values=(r[0],r[1],r[2],f"${r[3]:.2f}",f"${r[4]:.2f}",r[5],r[6]),
                     iid=str(r[0]), tags=(tag,))
         self.tabla_prod.tag_configure("low", foreground=C["yellow"])
 
@@ -520,10 +537,11 @@ class PuntoDeVenta(tk.Tk):
         if not sel:
             return
         vals = self.tabla_prod.item(sel[0], "values")
-        pid, codigo, nombre, precio, stock, cat = vals
+        pid, codigo, nombre, costo, precio, stock, cat = vals
+        costo = costo.replace("$","")
         precio = precio.replace("$","")
-        keys = ("e_codigo","e_nombre","e_precio","e_stock","e_categoria")
-        datos = (codigo, nombre, precio, stock, cat)
+        keys = ("e_codigo","e_nombre","e_costo","e_precio","e_stock","e_categoria")
+        datos = (codigo, nombre, costo, precio, stock, cat)
         for k,d in zip(keys, datos):
             self._prod_entries[k].delete(0,"end")
             self._prod_entries[k].insert(0, d)
@@ -533,31 +551,36 @@ class PuntoDeVenta(tk.Tk):
         try:
             codigo   = self._prod_entries["e_codigo"].get().strip()
             nombre   = self._prod_entries["e_nombre"].get().strip()
+            costo    = float(self._prod_entries["e_costo"].get().strip() or 0)
             precio   = float(self._prod_entries["e_precio"].get().strip())
             stock    = int(self._prod_entries["e_stock"].get().strip())
             categoria= self._prod_entries["e_categoria"].get().strip() or "General"
         except ValueError:
-            messagebox.showerror("Error", "Precio debe ser número. Stock debe ser entero.",
-                                 parent=self)
+            messagebox.showerror("Error",
+                "Costo y Precio deben ser números. Stock debe ser entero.",
+                parent=self)
             return
         if not codigo or not nombre:
             messagebox.showerror("Error", "Código y Nombre son obligatorios.", parent=self)
+            return
+        if costo < 0 or precio < 0:
+            messagebox.showerror("Error", "Costo y Precio no pueden ser negativos.", parent=self)
             return
 
         eid = getattr(self, "_editing_id", None)
         with get_conn() as conn:
             if eid:
                 conn.execute(
-                    "UPDATE productos SET codigo=?,nombre=?,precio=?,stock=?,categoria=?"
+                    "UPDATE productos SET codigo=?,nombre=?,costo=?,precio=?,stock=?,categoria=?"
                     " WHERE id=?",
-                    (codigo, nombre, precio, stock, categoria, eid))
+                    (codigo, nombre, costo, precio, stock, categoria, eid))
                 msg = "Producto actualizado."
             else:
                 try:
                     conn.execute(
-                        "INSERT INTO productos (codigo,nombre,precio,stock,categoria)"
-                        " VALUES (?,?,?,?,?)",
-                        (codigo, nombre, precio, stock, categoria))
+                        "INSERT INTO productos (codigo,nombre,costo,precio,stock,categoria)"
+                        " VALUES (?,?,?,?,?,?)",
+                        (codigo, nombre, costo, precio, stock, categoria))
                     msg = "Producto agregado."
                 except sqlite3.IntegrityError:
                     messagebox.showerror("Error",
@@ -624,8 +647,9 @@ class PuntoDeVenta(tk.Tk):
         # KPIs
         self.kpi_frame = tk.Frame(page, bg=C["bg"])
         self.kpi_frame.pack(fill="x", pady=(0,10))
-        self.kpi_ventas = self._kpi_box(self.kpi_frame, "VENTAS HOY", "0", C["accent"])
-        self.kpi_total  = self._kpi_box(self.kpi_frame, "TOTAL HOY",  "$0.00", C["green"])
+        self.kpi_ventas   = self._kpi_box(self.kpi_frame, "VENTAS HOY",   "0",      C["accent"])
+        self.kpi_total    = self._kpi_box(self.kpi_frame, "TOTAL HOY",    "$0.00",  C["green"])
+        self.kpi_ganancia = self._kpi_box(self.kpi_frame, "GANANCIA HOY", "$0.00",  C["yellow"])
 
         # Tabla historial ventas
         cols_v = ("id","fecha","total")
@@ -661,11 +685,11 @@ class PuntoDeVenta(tk.Tk):
                  font=("Courier",9,"bold")).pack(anchor="w", pady=(0,6))
 
         self.tabla_det = ttk.Treeview(right_h,
-            columns=("nombre","cant","precio","sub"),
+            columns=("nombre","cant","precio","sub","ganancia"),
             show="headings", style="POS.Treeview")
-        for c,h,w in zip(("nombre","cant","precio","sub"),
-                          ("Producto","Cant","Precio","Subtotal"),
-                          (160,40,70,80)):
+        for c,h,w in zip(("nombre","cant","precio","sub","ganancia"),
+                          ("Producto","Cant","Precio","Subtotal","Ganancia"),
+                          (130,35,65,70,70)):
             self.tabla_det.heading(c,text=h)
             self.tabla_det.column(c,width=w,anchor="center" if c!="nombre" else "w")
         self.tabla_det.pack(fill="both", expand=True)
@@ -697,7 +721,11 @@ class PuntoDeVenta(tk.Tk):
                     "SELECT id,fecha,total FROM ventas ORDER BY id DESC LIMIT 200"
                 ).fetchall()
             kpi = conn.execute(
-                "SELECT COUNT(*),IFNULL(SUM(total),0) FROM ventas WHERE fecha LIKE ?",
+                "SELECT COUNT(*), IFNULL(SUM(v.total),0),"
+                " IFNULL(SUM(dv.ganancia),0)"
+                " FROM ventas v"
+                " LEFT JOIN detalle_venta dv ON dv.venta_id = v.id"
+                " WHERE v.fecha LIKE ?",
                 (f"{today}%",)).fetchone()
         for r in rows:
             self.tabla_hist.insert("","end",
@@ -705,6 +733,7 @@ class PuntoDeVenta(tk.Tk):
         if hasattr(self,"kpi_ventas"):
             self.kpi_ventas.config(text=str(kpi[0]))
             self.kpi_total.config(text=f"${kpi[1]:.2f}")
+            self.kpi_ganancia.config(text=f"${kpi[2]:.2f}")
 
     def _ver_detalle_venta(self, event=None):
         sel = self.tabla_hist.selection()
@@ -715,11 +744,11 @@ class PuntoDeVenta(tk.Tk):
             self.tabla_det.delete(row)
         with get_conn() as conn:
             rows = conn.execute(
-                "SELECT nombre,cantidad,precio,subtotal FROM detalle_venta"
+                "SELECT nombre,cantidad,precio,subtotal,ganancia FROM detalle_venta"
                 " WHERE venta_id=?", (vid,)).fetchall()
         for r in rows:
             self.tabla_det.insert("","end",
-                values=(r[0],r[1],f"${r[2]:.2f}",f"${r[3]:.2f}"))
+                values=(r[0],r[1],f"${r[2]:.2f}",f"${r[3]:.2f}",f"${r[4]:.2f}"))
 
     # ══════════════════════════════════════════════════════
     #  GESTIÓN DE CONTRASEÑA DE ADMINISTRADOR
