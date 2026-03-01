@@ -98,6 +98,26 @@ def init_db():
                 ]
             )
 
+def _generar_codigo_unico():
+    """
+    Genera un código de producto único con formato PRD-YYYYMMDD-XXXX.
+    Verifica contra la BD y reintenta hasta 10 veces si hay colisión
+    (probabilidad prácticamente nula, pero se maneja correctamente).
+    """
+    import random
+    for _ in range(10):
+        fecha  = datetime.date.today().strftime("%Y%m%d")
+        sufijo = format(random.randint(0, 0xFFFF), "04X")   # 0000–FFFF
+        codigo = f"PRD-{fecha}-{sufijo}"
+        with get_conn() as conn:
+            existe = conn.execute(
+                "SELECT 1 FROM productos WHERE codigo = ?", (codigo,)
+            ).fetchone()
+        if not existe:
+            return codigo
+    # Fallback teórico: timestamp completo con microsegundos
+    return f"PRD-{datetime.datetime.now().strftime('%Y%m%d%H%M%S%f')}"
+
 # ──────────────────────────────────────────────────────────
 #  COLORES Y ESTILO
 # ──────────────────────────────────────────────────────────
@@ -180,7 +200,14 @@ class PuntoDeVenta(tk.Tk):
                      bg=C["card"] if k == labels[name] else C["panel"])
 
     def _show_ventas(self):    self._show_page("ventas")
-    def _show_productos(self): self._cargar_tabla_productos(); self._show_page("productos")
+    def _show_productos(self):
+        self._cargar_tabla_productos()
+        self._show_page("productos")
+        # Auto-generar código si el form está vacío (no hay edición activa)
+        if not getattr(self, "_editing_id", None):
+            cod = self._prod_entries["e_codigo"].get().strip()
+            if not cod:
+                self._autocodigo()
     def _show_historial(self): self._cargar_historial(); self._show_page("historial")
 
     # ══════════════════════════════════════════════════════
@@ -456,26 +483,47 @@ class PuntoDeVenta(tk.Tk):
                   ("Stock", "e_stock"), ("Categoría", "e_categoria")]
         self._prod_entries = {}
         for col, (lbl, key) in enumerate(fields):
-            tk.Label(form_card, text=lbl, fg=C["muted"] if key != "e_costo" else C["yellow"],
-                     bg=C["card"],
+            color_lbl = C["yellow"] if key == "e_costo" else C["muted"]
+            tk.Label(form_card, text=lbl, fg=color_lbl, bg=C["card"],
                      font=("Courier", 9)).grid(row=1, column=col, padx=(0,4), sticky="w")
-            ent = tk.Entry(form_card, bg=C["panel"], fg=C["text"],
-                           insertbackground=C["text"], bd=0, font=("Courier", 11),
-                           highlightbackground=C["border"], highlightthickness=1,
-                           width=12)
-            ent.grid(row=2, column=col, padx=(0,8), ipady=6, sticky="ew")
+
+            if key == "e_codigo":
+                # Campo Código: entry + botón ⟳ en un sub-frame
+                wrap = tk.Frame(form_card, bg=C["card"])
+                wrap.grid(row=2, column=col, padx=(0,8), sticky="ew")
+                ent = tk.Entry(wrap, bg=C["panel"], fg=C["text"],
+                               insertbackground=C["text"], bd=0, font=("Courier", 11),
+                               highlightbackground=C["border"], highlightthickness=1,
+                               width=12)
+                ent.pack(side="left", fill="x", expand=True, ipady=6)
+                tk.Button(wrap, text="⟳", bg=C["accent2"], fg=C["white"],
+                          bd=0, font=("Courier", 10), padx=5, cursor="hand2",
+                          activebackground="#6a4aaf",
+                          command=self._limpiar_form_producto).pack(side="left", padx=(2,0))
+            else:
+                ent = tk.Entry(form_card, bg=C["panel"], fg=C["text"],
+                               insertbackground=C["text"], bd=0, font=("Courier", 11),
+                               highlightbackground=C["border"], highlightthickness=1,
+                               width=12)
+                ent.grid(row=2, column=col, padx=(0,8), ipady=6, sticky="ew")
+
             self._prod_entries[key] = ent
         form_card.columnconfigure(1, weight=1)
 
         btn_frame = tk.Frame(form_card, bg=C["card"])
         btn_frame.grid(row=2, column=6, padx=(8,0), sticky="e")
+        # Nuevo: botón para crear un producto nuevo (limpia campos y genera código único)
+        tk.Button(btn_frame, text="● Producto nuevo", bg=C["accent2"], fg=C["white"],
+              bd=0, font=("Courier", 10), padx=12, pady=6, cursor="hand2",
+              activebackground="#6a4aaf",
+              command=self._nuevo_producto).pack(side="left", padx=(0,4))
 
         tk.Button(btn_frame, text="＋ Guardar", bg=C["accent"], fg=C["white"],
-                  bd=0, font=("Courier", 10, "bold"), padx=12, pady=6, cursor="hand2",
-                  command=self._guardar_producto).pack(side="left", padx=(0,4))
+              bd=0, font=("Courier", 10, "bold"), padx=12, pady=6, cursor="hand2",
+              command=self._guardar_producto).pack(side="left", padx=(0,4))
         tk.Button(btn_frame, text="✕ Eliminar", bg=C["red"], fg=C["white"],
-                  bd=0, font=("Courier", 10), padx=12, pady=6, cursor="hand2",
-                  command=self._eliminar_producto).pack(side="left")
+              bd=0, font=("Courier", 10), padx=12, pady=6, cursor="hand2",
+              command=self._eliminar_producto).pack(side="left")
 
         cols = ("id","codigo","nombre","costo","precio","stock","categoria")
         heads = ("ID","Código","Nombre","Costo","Precio venta","Stock","Categoría")
@@ -590,6 +638,7 @@ class PuntoDeVenta(tk.Tk):
         for e in self._prod_entries.values():
             e.delete(0,"end")
         self._editing_id = None
+        self._autocodigo()           # pre-cargar código para el siguiente producto
         self._cargar_tabla_productos()
         self._cargar_productos()
 
@@ -608,8 +657,47 @@ class PuntoDeVenta(tk.Tk):
             for e in self._prod_entries.values():
                 e.delete(0,"end")
             self._editing_id = None
+            self._autocodigo()       # pre-cargar código para el siguiente producto
             self._cargar_tabla_productos()
             self._cargar_productos()
+
+    def _autocodigo(self):
+        """
+        Genera un código único y lo coloca en el campo Código del formulario.
+        Solo actúa cuando NO se está editando un producto existente,
+        para no pisar el código real de un producto cargado.
+        """
+        # Si hay un producto seleccionado para edición, no tocar el campo
+        if getattr(self, "_editing_id", None):
+            return
+        codigo = _generar_codigo_unico()
+        e = self._prod_entries["e_codigo"]
+        e.delete(0, "end")
+        e.insert(0, codigo)
+
+    def _limpiar_form_producto(self):
+        """
+        Limpia todos los campos del formulario de producto y cancela cualquier edición.
+        El botón de flecha debe usar esta acción para vaciar código y datos.
+        """
+        for k, ent in self._prod_entries.items():
+            ent.delete(0, "end")
+        self._editing_id = None
+
+    def _nuevo_producto(self):
+        """
+        Preparar formulario para un producto nuevo: limpiar campos y generar
+        un código único verificando que no exista en la base de datos.
+        """
+        # Asegurarse de no estar en modo edición
+        self._editing_id = None
+        for ent in self._prod_entries.values():
+            ent.delete(0, "end")
+        # Genera y escribe un código único
+        self._autocodigo()
+        # Poner foco en el nombre para facilitar entrada
+        if "e_nombre" in self._prod_entries:
+            self._prod_entries["e_nombre"].focus()
 
     # ══════════════════════════════════════════════════════
     #  PÁGINA: HISTORIAL
