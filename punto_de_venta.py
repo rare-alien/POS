@@ -100,41 +100,54 @@ def init_db():
 
 def _generar_codigo_unico():
     """
-    Genera un código de producto único con formato PRD-YYYYMMDD-XXXX.
-    Verifica contra la BD y reintenta hasta 10 veces si hay colisión
-    (probabilidad prácticamente nula, pero se maneja correctamente).
+    Genera un código de producto único con formato P0001, P0002, ...
+    Busca el mayor sufijo numérico existente en la BD y retorna el siguiente
+    valor zero-padded a 4 dígitos. Si por alguna razón hay colisiones se
+    intenta avanzar hasta encontrar uno libre; si se agotan los intentos
+    se usa un fallback con timestamp.
     """
-    import random
-    for _ in range(10):
-        fecha  = datetime.date.today().strftime("%Y%m%d")
-        sufijo = format(random.randint(0, 0xFFFF), "04X")   # 0000–FFFF
-        codigo = f"PRD-{fecha}-{sufijo}"
-        with get_conn() as conn:
+    with get_conn() as conn:
+        # Obtener el máximo número usado en códigos del formato P####
+        row = conn.execute(
+            "SELECT MAX(CAST(SUBSTR(codigo,2) AS INTEGER)) FROM productos"
+            " WHERE codigo GLOB 'P[0-9][0-9][0-9][0-9]'"
+        ).fetchone()
+        maxn = row[0] or 0
+
+        # Intentar asignar el siguiente número, buscando hasta 10000 posibles
+        # valores (del 0001 al 9999). Si todos están ocupados, usar fallback.
+        for i in range(1, 10001):
+            cand = maxn + i
+            if cand > 9999:
+                break
+            codigo = f"P{cand:04d}"
             existe = conn.execute(
                 "SELECT 1 FROM productos WHERE codigo = ?", (codigo,)
             ).fetchone()
-        if not existe:
-            return codigo
-    # Fallback teórico: timestamp completo con microsegundos
-    return f"PRD-{datetime.datetime.now().strftime('%Y%m%d%H%M%S%f')}"
+            if not existe:
+                return codigo
+
+    # Fallback: usar timestamp para garantizar unicidad en escenarios extremos
+    return f"P{datetime.datetime.now().strftime('%Y%m%d%H%M%S%f')}"
 
 # ──────────────────────────────────────────────────────────
 #  COLORES Y ESTILO
 # ──────────────────────────────────────────────────────────
 C = {
-    "bg":        "#0f1117",
-    "panel":     "#1a1d27",
-    "card":      "#222638",
-    "border":    "#2e3247",
-    "accent":    "#4f8ef7",
-    "accent2":   "#7c5cbf",
-    "green":     "#2ecc71",
+    # Paleta solicitada: Verde Brillante, Verde Hierba, Verde Bosque, Verde Oscuro
+    "bg":        "#4CBB17",   # Verde Brillante: fondo
+    "panel":     "#ffffff",   # Paneles blancos (información)
+    "card":      "#ffffff",   # Tarjetas blancas
+    "border":    "#e6f3e8",
+    "accent":    "#48872B",   # Verde Hierba: botones / acentos
+    "accent2":   "#39542C",   # Verde Bosque: acentos secundarios
+    "green":     "#293325",   # Verde Oscuro
     "red":       "#e74c3c",
     "yellow":    "#f39c12",
-    "text":      "#e8eaf0",
-    "muted":     "#7a7f99",
+    "text":      "#062b00",   # Texto oscuro para contraste
+    "muted":     "#6b786e",
     "white":     "#ffffff",
-    "hover":     "#2d3250",
+    "hover":     "#a8e39a",
 }
 
 # ──────────────────────────────────────────────────────────
@@ -148,6 +161,8 @@ class PuntoDeVenta(tk.Tk):
         self.geometry("1200x750")
         self.minsize(900, 600)
         self.configure(bg=C["bg"])
+        # Aumentar tamaño de letra por defecto para mejorar legibilidad
+        self.option_add("*Font", "Courier 12")
         self.carrito = []
         self._build_ui()
         self._cargar_productos()
@@ -252,11 +267,11 @@ class PuntoDeVenta(tk.Tk):
         style.theme_use("clam")
         style.configure("POS.Treeview",
             background=C["card"], fieldbackground=C["card"],
-            foreground=C["text"], rowheight=32,
-            font=("Courier", 10), borderwidth=0)
+            foreground=C["text"], rowheight=38,
+            font=("Courier", 12), borderwidth=0)
         style.configure("POS.Treeview.Heading",
             background=C["border"], foreground=C["muted"],
-            font=("Courier", 9, "bold"), relief="flat")
+            font=("Courier", 11, "bold"), relief="flat")
         style.map("POS.Treeview",
             background=[("selected", C["accent2"])],
             foreground=[("selected", C["white"])])
