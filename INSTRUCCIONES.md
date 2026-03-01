@@ -61,3 +61,4 @@ python3 punto_de_venta.py
 - Los datos de ejemplo incluidos son solo para demostración; puedes eliminarlos
 - El archivo .db y el .py deben estar en la misma carpeta
 - Compatible con Windows 10, Windows 11, Linux, macOS
+- jdsnjanadjvnadjidfjd
