@@ -280,11 +280,12 @@ class PuntoDeVenta(tk.Tk):
                                        style="POS.Treeview", selectmode="browse")
         widths = [80, 260, 90, 70]
         for c, h, w in zip(cols, heads, widths):
-            self.tabla_busq.heading(c, text=h)
-            self.tabla_busq.column(c, width=w, anchor="center" if c != "nombre" else "w")
+            # Centrar encabezado y contenido; usar anchos fijos para evitar solapamientos
+            self.tabla_busq.heading(c, text=h, anchor="center")
+            self.tabla_busq.column(c, width=w, anchor="center", stretch=False)
 
         sb = ttk.Scrollbar(frame_t, orient="vertical",
-                           command=self.tabla_busq.yview)
+               command=self.tabla_busq.yview)
         self.tabla_busq.configure(yscrollcommand=sb.set)
         self.tabla_busq.pack(side="left", fill="both", expand=True)
         sb.pack(side="right", fill="y")
@@ -550,10 +551,11 @@ class PuntoDeVenta(tk.Tk):
         self.tabla_prod = ttk.Treeview(frame_t, columns=cols, show="headings",
                                        style="POS.Treeview", selectmode="browse")
         for c,h,w in zip(cols,heads,widths):
-            self.tabla_prod.heading(c, text=h)
-            self.tabla_prod.column(c, width=w, anchor="center" if c!="nombre" else "w")
+            # Centrar encabezado y contenido; usar anchos fijos
+            self.tabla_prod.heading(c, text=h, anchor="center")
+            self.tabla_prod.column(c, width=w, anchor="center", stretch=False)
         sb = ttk.Scrollbar(frame_t, orient="vertical",
-                           command=self.tabla_prod.yview)
+                   command=self.tabla_prod.yview)
         self.tabla_prod.configure(yscrollcommand=sb.set)
         self.tabla_prod.pack(side="left", fill="both", expand=True)
         sb.pack(side="right", fill="y")
@@ -769,10 +771,11 @@ class PuntoDeVenta(tk.Tk):
         left_h.pack(side="left", fill="both", expand=True, padx=(0,8))
 
         self.tabla_hist = ttk.Treeview(left_h, columns=cols_v, show="headings",
-                                       style="POS.Treeview", height=12)
-        for c,h,w in zip(cols_v,("ID","Fecha","Total"),(50,200,100)):
-            self.tabla_hist.heading(c, text=h)
-            self.tabla_hist.column(c, width=w, anchor="center")
+                                       style="POS.Treeview", height=8)
+        for c,h,w in zip(cols_v,("ID","Fecha","Total"),(40,150,80)):
+            # Centrar encabezado y contenido; usar anchos fijos para evitar overflow
+            self.tabla_hist.heading(c, text=h, anchor="center")
+            self.tabla_hist.column(c, width=w, anchor="center", stretch=False)
         sb = ttk.Scrollbar(left_h, orient="vertical", command=self.tabla_hist.yview)
         self.tabla_hist.configure(yscrollcommand=sb.set)
         self.tabla_hist.pack(side="left", fill="both", expand=True)
@@ -780,7 +783,7 @@ class PuntoDeVenta(tk.Tk):
         self.tabla_hist.bind("<<TreeviewSelect>>", self._ver_detalle_venta)
 
         # Detalle venta
-        right_h = tk.Frame(split, bg=C["card"], padx=12, pady=12, width=350)
+        right_h = tk.Frame(split, bg=C["card"], padx=12, pady=12, width=480)
         right_h.pack(side="right", fill="y")
         right_h.pack_propagate(False)
 
@@ -792,10 +795,20 @@ class PuntoDeVenta(tk.Tk):
             show="headings", style="POS.Treeview")
         for c,h,w in zip(("nombre","cant","precio","sub","ganancia"),
                           ("Producto","Cant","Precio","Subtotal","Ganancia"),
-                          (130,35,65,70,70)):
-            self.tabla_det.heading(c,text=h)
-            self.tabla_det.column(c,width=w,anchor="center" if c!="nombre" else "w")
+                          (250,50,85,90,90)):
+            # Centrar encabezado y contenido para que no sobresalgan
+            self.tabla_det.heading(c, text=h, anchor="center")
+            self.tabla_det.column(c, width=w, anchor="center", stretch=False)
         self.tabla_det.pack(fill="both", expand=True)
+
+        # Evitar que el usuario redimensione las cabeceras arrastrando el separador
+        def _block_resize(event, tv):
+            if tv.identify_region(event.x, event.y) == "separator":
+                return "break"
+        self.tabla_hist.bind("<Button-1>", lambda e: _block_resize(e, self.tabla_hist), add=True)
+        self.tabla_hist.bind("<B1-Motion>", lambda e: _block_resize(e, self.tabla_hist), add=True)
+        self.tabla_det.bind("<Button-1>", lambda e: _block_resize(e, self.tabla_det), add=True)
+        self.tabla_det.bind("<B1-Motion>", lambda e: _block_resize(e, self.tabla_det), add=True)
 
     def _kpi_box(self, parent, label, value, color):
         box = tk.Frame(parent, bg=C["card"], padx=20, pady=12)
