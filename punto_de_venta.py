@@ -282,7 +282,7 @@ class PuntoDeVenta(tk.Tk):
         for c, h, w in zip(cols, heads, widths):
             # Centrar encabezado y contenido; usar anchos fijos para evitar solapamientos
             self.tabla_busq.heading(c, text=h, anchor="center")
-            self.tabla_busq.column(c, width=w, anchor="center", stretch=False)
+            self.tabla_busq.column(c, width=w, anchor="center", stretch=True)
 
         sb = ttk.Scrollbar(frame_t, orient="vertical",
                command=self.tabla_busq.yview)
@@ -553,7 +553,7 @@ class PuntoDeVenta(tk.Tk):
         for c,h,w in zip(cols,heads,widths):
             # Centrar encabezado y contenido; usar anchos fijos
             self.tabla_prod.heading(c, text=h, anchor="center")
-            self.tabla_prod.column(c, width=w, anchor="center", stretch=False)
+            self.tabla_prod.column(c, width=w, anchor="center", stretch=True)
         sb = ttk.Scrollbar(frame_t, orient="vertical",
                    command=self.tabla_prod.yview)
         self.tabla_prod.configure(yscrollcommand=sb.set)
@@ -775,7 +775,7 @@ class PuntoDeVenta(tk.Tk):
         for c,h,w in zip(cols_v,("ID","Fecha","Total"),(40,150,80)):
             # Centrar encabezado y contenido; usar anchos fijos para evitar overflow
             self.tabla_hist.heading(c, text=h, anchor="center")
-            self.tabla_hist.column(c, width=w, anchor="center", stretch=False)
+            self.tabla_hist.column(c, width=w, anchor="center", stretch=True)
         sb = ttk.Scrollbar(left_h, orient="vertical", command=self.tabla_hist.yview)
         self.tabla_hist.configure(yscrollcommand=sb.set)
         self.tabla_hist.pack(side="left", fill="both", expand=True)
@@ -795,7 +795,7 @@ class PuntoDeVenta(tk.Tk):
             show="headings", style="POS.Treeview")
         for c,h,w in zip(("nombre","cant","precio","sub","ganancia"),
                           ("Producto","Cant","Precio","Subtotal","Ganancia"),
-                          (250,50,85,90,90)):
+                          (140,50,85,90,90)):
             # Centrar encabezado y contenido para que no sobresalgan
             self.tabla_det.heading(c, text=h, anchor="center")
             self.tabla_det.column(c, width=w, anchor="center", stretch=False)
