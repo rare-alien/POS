@@ -1,64 +1,124 @@
-# Punto de Venta — Instrucciones de uso
+# Punto de Venta — Guía de instalación en Windows (Producción)
 
-## Requisitos
-- Python 3.8 o superior (viene incluido en muchas distros Linux; en Windows descargar de python.org)
-- No requiere instalar librerías externas (usa tkinter y sqlite3 que vienen con Python)
+---
 
-## Cómo ejecutar
+## Estructura de archivos que debes tener
 
-### En Linux Mint (desarrollo):
-```bash
-python3 punto_de_venta.py
+Antes de empezar, asegúrate de que **todos estos archivos estén en la misma carpeta**:
+
+```
+📁 PuntoDeVenta/
+ ├── punto_de_venta.py      ← el programa
+ ├── CONSTRUIR_EXE.bat      ← script de construcción (nuevo)
+ └── INSTRUCCIONES.md       ← este archivo
 ```
 
-### En Windows 10 (producción):
-1. Instalar Python desde https://python.org (marcar "Add Python to PATH" al instalar)
-2. Doble clic en `punto_de_venta.py`
-   — ó —
-   Abrir CMD en la carpeta y escribir: `python punto_de_venta.py`
-
-## Base de datos
-- Se crea automáticamente el archivo `ventas.db` en la misma carpeta que el .py
-- **Para hacer respaldos**: simplemente copia el archivo `ventas.db`
-- Si borras `ventas.db`, se crea uno nuevo vacío al iniciar
+> La carpeta `respaldos_csv/` y el archivo `ventas.db` se crean automáticamente
+> la primera vez que ejecutas el programa.
 
 ---
 
-## Funciones principales
+## PASO 1 — Instalar Python en Windows (solo una vez)
 
-### 🛒 Pestaña "Ventas" (pantalla principal)
-- **Barra de búsqueda**: escribe el nombre o código del producto
-- Presiona **Enter** o doble clic para agregar al carrito
-- La tecla **↓** mueve el foco a la lista de resultados
-- El botón **COBRAR VENTA** registra la venta y descuenta el stock automáticamente
-
-### 📦 Pestaña "Productos"
-- **Agregar producto nuevo**: llena el formulario y da clic en "＋ Guardar"
-- **Editar producto**: haz clic en un producto de la tabla → se llena el formulario → modifica → "＋ Guardar"
-- **Eliminar producto**: selecciona en tabla → "✕ Eliminar"
-- Productos con stock ≤ 5 se muestran en amarillo como advertencia
-
-### 📊 Pestaña "Historial"
-- Muestra todas las ventas registradas con su detalle
-- KPIs del día (ventas totales y monto)
-- Filtro por fecha (formato YYYY-MM-DD)
-- Al hacer clic en una venta se ve el detalle en el panel derecho
+1. Entra a **https://python.org** → Downloads → descarga la versión más reciente
+2. Ejecuta el instalador
+3. ⚠️ **MUY IMPORTANTE:** en la primera pantalla del instalador,
+   activa la casilla **"Add Python to PATH"** antes de hacer clic en *Install Now*
+4. Cuando termine, abre el *Símbolo del sistema* (CMD) y escribe:
+   ```
+   python --version
+   ```
+   Si ves un número de versión, Python está correctamente instalado.
 
 ---
 
-## Campos de producto
-| Campo     | Descripción                        | Ejemplo      |
-|-----------|------------------------------------|--------------|
-| Código    | Identificador único (obligatorio)  | P001, 7501   |
-| Nombre    | Nombre del producto (obligatorio)  | Refresco 600ml |
-| Precio $  | Precio de venta                    | 18.50        |
-| Stock     | Unidades disponibles               | 50           |
-| Categoría | Clasificación (opcional)           | Bebidas      |
+## PASO 2 — Construir el ejecutable .exe (solo una vez)
+
+1. Abre la carpeta `PuntoDeVenta/` en el Explorador de Windows
+2. Haz doble clic en **`CONSTRUIR_EXE.bat`**
+3. Se abrirá una ventana negra que mostrará el progreso — espera entre 1 y 3 minutos
+4. Cuando termine, la carpeta `dist/` se abrirá automáticamente con el archivo:
+
+```
+📁 dist/
+ └── PuntoDeVenta.exe    ← este es tu programa
+```
+
+> Este proceso solo necesitas hacerlo **una vez**, o cuando actualices el código `.py`.
+> La base de datos `ventas.db` no se ve afectada al reconstruir el ejecutable.
 
 ---
 
-## Notas
-- Los datos de ejemplo incluidos son solo para demostración; puedes eliminarlos
-- El archivo .db y el .py deben estar en la misma carpeta
-- Compatible con Windows 10, Windows 11, Linux, macOS
-- jdsnjanadjvnadjidfjd
+## PASO 3 — Configurar la carpeta de producción
+
+### 3.1 — Crear la carpeta definitiva del programa
+
+Crea una carpeta en una ubicación permanente, por ejemplo:
+
+```
+C:\PuntoDeVenta\
+```
+
+### 3.2 — Copiar los archivos necesarios
+
+Copia **exactamente** estos archivos a `C:\PuntoDeVenta\`:
+
+| Archivo | Descripción |
+|---------|-------------|
+| `dist\PuntoDeVenta.exe` | El ejecutable principal |
+| `ventas.db` *(si ya tienes datos)* | Tu base de datos existente |
+
+> ⚠️ **Importante:** el `.exe` busca `ventas.db` en **la misma carpeta donde él esté**.
+> Si mueves el `.exe` sin mover la `ventas.db`, el programa creará una base de datos nueva vacía.
+
+### 3.3 — Estructura final en producción
+
+```
+📁 C:\PuntoDeVenta\
+ ├── PuntoDeVenta.exe       ← programa
+ ├── ventas.db              ← base de datos (se crea sola si no existe)
+ └── respaldos_csv\         ← se crea sola al exportar por primera vez
+```
+
+---
+
+## PASO 4 — Crear el acceso directo en el escritorio
+
+1. En `C:\PuntoDeVenta\`, haz **clic derecho** sobre `PuntoDeVenta.exe`
+2. Selecciona **Enviar a → Escritorio (crear acceso directo)**
+3. Opcionalmente, haz clic derecho sobre el acceso directo → **Cambiar nombre** → ponle `Punto de Venta`
+
+Desde ese momento, un **doble clic** en el acceso directo abre el programa directamente,
+sin terminal, sin Python visible, como cualquier programa de Windows.
+
+---
+
+## Respaldos de datos
+
+Tu base de datos está en `C:\PuntoDeVenta\ventas.db`. Para respaldarla:
+
+- **Manual:** copia el archivo `ventas.db` a una USB o carpeta de respaldo
+- **Desde el programa:** usa el botón **💾 Exportar CSV** en la pestaña Historial
+
+> Recomendación: haz una copia de `ventas.db` al final de cada semana.
+
+---
+
+## Solución de problemas comunes
+
+| Síntoma | Causa probable | Solución |
+|---------|----------------|----------|
+| El `.exe` se abre y se cierra inmediatamente | Falta una librería o error en el código | Ejecuta el `.py` original en VSC para ver el error exacto |
+| "Windows protegió tu PC" al ejecutar | Windows SmartScreen bloquea ejecutables nuevos | Haz clic en "Más información" → "Ejecutar de todas formas" |
+| Los datos no aparecen al abrir | El `.exe` no encuentra `ventas.db` | Asegúrate de que `ventas.db` esté en la **misma carpeta** que el `.exe` |
+| `CONSTRUIR_EXE.bat` da error de Python | Python no está en el PATH | Reinstala Python marcando "Add Python to PATH" |
+
+---
+
+## Cuándo volver a construir el .exe
+
+Solo necesitas repetir el **Paso 2** cuando:
+- Hayas modificado el código `punto_de_venta.py`
+- Quieras agregar nuevas funciones al programa
+
+Los datos en `ventas.db` **nunca** se borran al reconstruir el ejecutable.

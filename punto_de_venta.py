@@ -7,7 +7,7 @@
 
 import tkinter as tk
 from tkinter import ttk, messagebox, font as tkfont
-import sqlite3, os, datetime, hashlib
+import sqlite3, os, datetime, hashlib, csv
 
 # ──────────────────────────────────────────────────────────
 #  BASE DE DATOS
@@ -748,7 +748,14 @@ class PuntoDeVenta(tk.Tk):
                   font=("Courier", 10), padx=12, pady=4, cursor="hand2",
                   activebackground="#6a4aaf",
                   command=self._cambiar_contrasena).pack(side="right", padx=(0,8))
-
+        
+        # Botón Exportar CSV
+        tk.Button(filter_f, text="💾  Exportar CSV",
+                  bg=C["accent"], fg=C["white"], bd=0,
+                  font=("Courier", 10, "bold"), padx=12, pady=4, cursor="hand2",
+                  activebackground="#3a7de0",
+                  command=self._exportar_csv).pack(side="right", padx=(0,8))
+     
         # KPIs
         self.kpi_frame = tk.Frame(page, bg=C["bg"])
         self.kpi_frame.pack(fill="x", pady=(0,10))
@@ -865,15 +872,67 @@ class PuntoDeVenta(tk.Tk):
         for r in rows:
             self.tabla_det.insert("","end",
                 values=(r[0],r[1],f"${r[2]:.2f}",f"${r[3]:.2f}",f"${r[4]:.2f}"))
+    def _exportar_csv(self):
+        """
+        Consulta la base de datos y exporta todas las ventas con sus detalles
+        a un archivo CSV dentro de la carpeta 'respaldos_csv'.
+        """
+        # 1. Definir la carpeta donde se guardarán los archivos y crearla si no existe
+        carpeta_base = os.path.dirname(os.path.abspath(__file__))
+        carpeta_respaldos = os.path.join(carpeta_base, "respaldos_csv")
+        os.makedirs(carpeta_respaldos, exist_ok=True)
+
+        # 2. Generar un nombre de archivo único usando la fecha y hora actual
+        fecha_str = datetime.datetime.now().strftime("%Y%m%d_%H%M%S")
+        nombre_archivo = f"historial_ventas_{fecha_str}.csv"
+        ruta_completa = os.path.join(carpeta_respaldos, nombre_archivo)
+
+        try:
+            # 3. Consultar la base de datos
+            with get_conn() as conn:
+                cursor = conn.cursor()
+                # Hacemos un JOIN para obtener los datos de la venta y los productos vendidos
+                cursor.execute("""
+                    SELECT v.id, v.fecha, v.total, 
+                           dv.nombre, dv.cantidad, dv.precio, dv.subtotal, dv.ganancia
+                    FROM ventas v
+                    LEFT JOIN detalle_venta dv ON v.id = dv.venta_id
+                    ORDER BY v.id DESC
+                """)
+                filas = cursor.fetchall()
+
+            # 4. Escribir los datos en el archivo CSV
+            with open(ruta_completa, mode="w", newline="", encoding="utf-8") as archivo_csv:
+                escritor = csv.writer(archivo_csv)
+        
+                # Escribir la fila de encabezados
+                escritor.writerow([
+                    "ID_Venta", "Fecha_Venta", "Total_Venta", 
+                    "Producto", "Cantidad", "Precio_Unitario", "Subtotal_Producto", "Ganancia_Producto"
+                ])
+        
+                # Escribir todas las filas obtenidas de la base de datos
+                escritor.writerows(filas)
+
+            # 5. Mostrar mensaje de éxito al usuario
+            messagebox.showinfo(
+                "✔ Exportación exitosa",
+                f"El historial se ha exportado correctamente.\n\nArchivo guardado en:\n{ruta_completa}",
+                parent=self
+            )
+
+        except Exception as e:
+            # Manejo de errores por si falla la escritura o la consulta
+            messagebox.showerror(
+                "Error de exportación",
+                f"Ocurrió un problema al exportar el archivo CSV:\n{str(e)}",
+                parent=self
+            )
 
     # ══════════════════════════════════════════════════════
     #  GESTIÓN DE CONTRASEÑA DE ADMINISTRADOR
     # ══════════════════════════════════════════════════════
     def _verificar_contrasena_inicial(self):
-        """
-        Se llama al arrancar. Si no existe contraseña en BD, muestra un
-        diálogo obligatorio para crear una. No se puede cerrar sin crearla.
-        """
         if get_admin_hash() is not None:
             return  # Ya existe contraseña → todo en orden, continuar normalmente
 
@@ -1171,18 +1230,15 @@ class PuntoDeVenta(tk.Tk):
         )
 
     def _pedir_y_validar_password(self, venta_id, fecha, total):
-        """
-        Muestra un diálogo modal para ingresar la contraseña de administrador.
-        Permite hasta 3 intentos antes de bloquear la operación.
-        Retorna True si la contraseña es correcta, False en caso contrario.
+        """Muestra un diálogo modal para ingresar la contraseña de administrador.
+            Permite hasta 3 intentos antes de bloquear la operación.
+            Retorna True si la contraseña es correcta, False en caso contrario.
 
-        Por qué un método separado:
-          - Responsabilidad única: solo se ocupa de autenticar
-          - Testeable de forma independiente
-          - Reutilizable si en el futuro se necesita en otras acciones protegidas
-        """
+            Por qué un método separado:
+              - Responsabilidad única: solo se ocupa de autenticar
+              - Testeable de forma independiente
+              - Reutilizable si en el futuro se necesita en otras acciones protegidas"""
         MAX_INTENTOS = 3
-
         for intento in range(1, MAX_INTENTOS + 1):
 
             # ── Construir el diálogo modal ────────────────────────────────
