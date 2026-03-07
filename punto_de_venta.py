@@ -9,6 +9,18 @@ import tkinter as tk
 from tkinter import ttk, messagebox, font as tkfont
 import sqlite3, os, datetime, hashlib, csv
 
+# ── python-docx (inventario físico) — opcional ────────────
+try:
+    from docx import Document
+    from docx.shared import Pt, RGBColor, Cm
+    from docx.enum.text import WD_ALIGN_PARAGRAPH
+    from docx.enum.table import WD_ALIGN_VERTICAL, WD_TABLE_ALIGNMENT
+    from docx.oxml.ns import qn
+    from docx.oxml import OxmlElement
+    _DOCX_OK = True
+except ImportError:
+    _DOCX_OK = False
+
 # ──────────────────────────────────────────────────────────
 #  BASE DE DATOS
 # ──────────────────────────────────────────────────────────
@@ -51,8 +63,9 @@ def init_db():
                 nombre    TEXT    NOT NULL,
                 precio    REAL    NOT NULL DEFAULT 0,
                 costo     REAL    NOT NULL DEFAULT 0,
-                stock     INTEGER NOT NULL DEFAULT 0,
-                categoria TEXT    DEFAULT 'General'
+                stock     REAL    NOT NULL DEFAULT 0,
+                categoria TEXT    DEFAULT 'General',
+                a_granel  INTEGER NOT NULL DEFAULT 0
             );
 
             CREATE TABLE IF NOT EXISTS ventas (
@@ -68,9 +81,10 @@ def init_db():
                 nombre      TEXT    NOT NULL,
                 precio      REAL    NOT NULL,
                 costo       REAL    NOT NULL DEFAULT 0,
-                cantidad    INTEGER NOT NULL,
+                cantidad    REAL    NOT NULL,
                 subtotal    REAL    NOT NULL,
                 ganancia    REAL    NOT NULL DEFAULT 0,
+                es_granel   INTEGER NOT NULL DEFAULT 0,
                 FOREIGN KEY (venta_id)    REFERENCES ventas(id),
                 FOREIGN KEY (producto_id) REFERENCES productos(id)
             );
@@ -78,8 +92,10 @@ def init_db():
         # Migración: agregar columnas a BD existente sin perder datos
         for sql in [
             "ALTER TABLE productos ADD COLUMN costo REAL NOT NULL DEFAULT 0",
+            "ALTER TABLE productos ADD COLUMN a_granel INTEGER NOT NULL DEFAULT 0",
             "ALTER TABLE detalle_venta ADD COLUMN costo REAL NOT NULL DEFAULT 0",
             "ALTER TABLE detalle_venta ADD COLUMN ganancia REAL NOT NULL DEFAULT 0",
+            "ALTER TABLE detalle_venta ADD COLUMN es_granel INTEGER NOT NULL DEFAULT 0",
         ]:
             try:
                 conn.execute(sql)
@@ -99,23 +115,12 @@ def init_db():
             )
 
 def _generar_codigo_unico():
-    """
-    Genera un código de producto único con formato P0001, P0002, ...
-    Busca el mayor sufijo numérico existente en la BD y retorna el siguiente
-    valor zero-padded a 4 dígitos. Si por alguna razón hay colisiones se
-    intenta avanzar hasta encontrar uno libre; si se agotan los intentos
-    se usa un fallback con timestamp.
-    """
     with get_conn() as conn:
-        # Obtener el máximo número usado en códigos del formato P####
         row = conn.execute(
             "SELECT MAX(CAST(SUBSTR(codigo,2) AS INTEGER)) FROM productos"
             " WHERE codigo GLOB 'P[0-9][0-9][0-9][0-9]'"
         ).fetchone()
         maxn = row[0] or 0
-
-        # Intentar asignar el siguiente número, buscando hasta 10000 posibles
-        # valores (del 0001 al 9999). Si todos están ocupados, usar fallback.
         for i in range(1, 10001):
             cand = maxn + i
             if cand > 9999:
@@ -126,25 +131,248 @@ def _generar_codigo_unico():
             ).fetchone()
             if not existe:
                 return codigo
-
-    # Fallback: usar timestamp para garantizar unicidad en escenarios extremos
     return f"P{datetime.datetime.now().strftime('%Y%m%d%H%M%S%f')}"
+
+# ──────────────────────────────────────────────────────────
+#  GENERADOR DE INVENTARIO FÍSICO (.docx)
+# ──────────────────────────────────────────────────────────
+
+def _rgb(hex_str):
+    h = hex_str.lstrip("#")
+    return RGBColor(int(h[0:2],16), int(h[2:4],16), int(h[4:6],16))
+
+def _cell_bg(cell, hex_color):
+    tc = cell._tc; tcPr = tc.get_or_add_tcPr()
+    shd = OxmlElement("w:shd")
+    shd.set(qn("w:val"), "clear"); shd.set(qn("w:color"), "auto")
+    shd.set(qn("w:fill"), hex_color.lstrip("#").upper())
+    ex = tcPr.find(qn("w:shd"))
+    if ex is not None: tcPr.remove(ex)
+    tcPr.append(shd)
+
+def _cell_borders(cell, color="C8E6C9", sz=4):
+    tc = cell._tc; tcPr = tc.get_or_add_tcPr()
+    ex = tcPr.find(qn("w:tcBorders"))
+    if ex is not None: tcPr.remove(ex)
+    bd = OxmlElement("w:tcBorders")
+    for side in ("top","left","bottom","right"):
+        n = OxmlElement(f"w:{side}")
+        n.set(qn("w:val"),"single"); n.set(qn("w:sz"),str(sz*8))
+        n.set(qn("w:space"),"0"); n.set(qn("w:color"),color.lstrip("#").upper())
+        bd.append(n)
+    tcPr.append(bd)
+
+def _cell_write(cell, text, bold=False, size=9, color="1B2E1C",
+                align=None, bg=None):
+    if align is None:
+        align = WD_ALIGN_PARAGRAPH.CENTER
+    cell.vertical_alignment = WD_ALIGN_VERTICAL.CENTER
+    p = cell.paragraphs[0]; p.alignment = align
+    tc = cell._tc; tcPr = tc.get_or_add_tcPr()
+    mar = OxmlElement("w:tcMar")
+    for side,v in [("top","40"),("bottom","40"),("left","80"),("right","80")]:
+        m = OxmlElement(f"w:{side}"); m.set(qn("w:w"),v); m.set(qn("w:type"),"dxa")
+        mar.append(m)
+    ex = tcPr.find(qn("w:tcMar"))
+    if ex is not None: tcPr.remove(ex)
+    tcPr.append(mar)
+    r = p.add_run(str(text))
+    r.bold = bold; r.font.name = "Arial"
+    r.font.size = Pt(size); r.font.color.rgb = _rgb(color)
+    if bg: _cell_bg(cell, bg)
+
+def _col_width(table, col_idx, cm):
+    for row in table.rows:
+        tc = row.cells[col_idx]._tc; tcPr = tc.get_or_add_tcPr()
+        w = OxmlElement("w:tcW")
+        w.set(qn("w:w"), str(int(cm*567))); w.set(qn("w:type"),"dxa")
+        ex = tcPr.find(qn("w:tcW"))
+        if ex is not None: tcPr.remove(ex)
+        tcPr.append(w)
+
+def _tbl_fixed(table):
+    tbl = table._tbl; tblPr = tbl.find(qn("w:tblPr"))
+    if tblPr is None: tblPr = OxmlElement("w:tblPr"); tbl.insert(0,tblPr)
+    lay = OxmlElement("w:tblLayout"); lay.set(qn("w:type"),"fixed")
+    ex = tblPr.find(qn("w:tblLayout"))
+    if ex is not None: tblPr.remove(ex)
+    tblPr.append(lay)
+
+def generar_docx_inventario(productos, ruta_salida):
+    """
+    Genera un .docx de levantamiento de inventario físico.
+    productos: list[tuple] → (id, codigo, nombre, precio, costo, stock, categoria)
+    ruta_salida: str → ruta completa donde guardar el archivo
+    Propaga excepciones al llamador para que las maneje con messagebox.
+    """
+    CLR = {
+        "hdr":     "2E7D32", "sub":  "A5D6A7", "fila":  "F1F8E9",
+        "bosque":  "39542C", "hier": "48872B", "borde": "C8E6C9",
+        "borde_o": "39542C", "txt":  "1B2E1C", "mut":   "555555",
+        "rojo":    "C62828", "bco":  "FFFFFF",
+    }
+    doc = Document()
+    sec = doc.sections[0]
+    sec.orientation = 1          # landscape
+    sec.page_width  = Cm(29.7); sec.page_height = Cm(21.0)
+    sec.left_margin = sec.right_margin = sec.top_margin = sec.bottom_margin = Cm(1.5)
+    doc.styles["Normal"].font.name = "Arial"
+    doc.styles["Normal"].font.size = Pt(10)
+
+    # ── Encabezado ─────────────────────────────────────────
+    t = doc.add_paragraph()
+    r = t.add_run("HOJA DE LEVANTAMIENTO DE INVENTARIO FÍSICO")
+    r.bold = True; r.font.size = Pt(16); r.font.name = "Arial"
+    r.font.color.rgb = _rgb(CLR["bosque"])
+    s = doc.add_paragraph()
+    rs = s.add_run("Sistema: Punto de Venta  •  Base de datos: ventas.db  •  Tabla: productos")
+    rs.font.size = Pt(9); rs.font.name = "Arial"; rs.font.color.rgb = _rgb(CLR["hier"])
+    s.paragraph_format.space_after = Pt(4)
+    hr = doc.add_paragraph(); hr.paragraph_format.space_after = Pt(6)
+    pPr = hr._p.get_or_add_pPr(); pBdr = OxmlElement("w:pBdr")
+    bot = OxmlElement("w:bottom"); bot.set(qn("w:val"),"single")
+    bot.set(qn("w:sz"),"6"); bot.set(qn("w:space"),"1")
+    bot.set(qn("w:color"),CLR["bosque"]); pBdr.append(bot); pPr.append(pBdr)
+
+    # ── Datos del levantamiento ────────────────────────────
+    fecha_hoy = datetime.datetime.now().strftime("%d / %m / %Y")
+    it = doc.add_table(rows=2, cols=4); _tbl_fixed(it)
+    it.alignment = WD_TABLE_ALIGNMENT.LEFT
+    for idx,(lbl,val) in enumerate([
+        ("Responsable del conteo:",""),("Fecha del conteo:",fecha_hoy),
+        ("Supervisor / Autoriza:",""),("Folio / Consecutivo:",""),
+    ]):
+        ri,ci = idx//2, (idx%2)*2
+        _cell_write(it.cell(ri,ci),lbl,bold=True,size=8,color=CLR["bosque"],
+                    align=WD_ALIGN_PARAGRAPH.LEFT,bg=CLR["fila"])
+        _cell_write(it.cell(ri,ci+1),val,size=9,align=WD_ALIGN_PARAGRAPH.LEFT,bg=CLR["bco"])
+        for c in (it.cell(ri,ci), it.cell(ri,ci+1)): _cell_borders(c,CLR["borde"])
+    for i,w in enumerate([4.5,5.5,4.5,5.5]): _col_width(it,i,w)
+    doc.add_paragraph().paragraph_format.space_after = Pt(4)
+
+    # ── Tabla de inventario ────────────────────────────────
+    COLS = [("#",1.0),("Código",2.0),("Categoría",3.0),("Nombre del Producto",6.0),
+            ("Costo ($)",2.2),("Precio ($)",2.2),("Stock\nSistema",2.2),
+            ("Stock\nFísico",2.2),("Diferencia",2.2),("Observaciones",3.7)]
+    n = len(COLS)
+    tp = doc.add_paragraph(); tp.paragraph_format.space_before = Pt(2)
+    tp.paragraph_format.space_after = Pt(2)
+    rt2 = tp.add_run("INVENTARIO DE PRODUCTOS")
+    rt2.bold=True; rt2.font.size=Pt(10); rt2.font.name="Arial"
+    rt2.font.color.rgb=_rgb(CLR["bosque"])
+    total_stock = sum(p[5] for p in productos)
+    rp = doc.add_paragraph(); rp.paragraph_format.space_after = Pt(3)
+    rr2 = rp.add_run(
+        f"Total de registros: {len(productos)} productos  •  "
+        f"Stock total en sistema: {total_stock} unidades")
+    rr2.font.size=Pt(8.5); rr2.font.name="Arial"; rr2.font.color.rgb=_rgb(CLR["hier"])
+
+    inv = doc.add_table(rows=1, cols=n); _tbl_fixed(inv)
+    inv.alignment = WD_TABLE_ALIGNMENT.LEFT
+    for i,(lbl,_) in enumerate(COLS):
+        _cell_write(inv.rows[0].cells[i],lbl,bold=True,size=8.5,
+                    color=CLR["bco"],bg=CLR["hdr"])
+        _cell_borders(inv.rows[0].cells[i],CLR["borde_o"],5)
+
+    categorias = list(dict.fromkeys(p[6] for p in productos))
+    for cat in categorias:
+        sep = inv.add_row(); mc = sep.cells[0]
+        for j in range(1,n): mc = mc.merge(sep.cells[j])
+        _cell_write(mc,f"  ▶  {cat.upper()}",bold=True,size=9,color=CLR["bosque"],
+                    align=WD_ALIGN_PARAGRAPH.LEFT,bg=CLR["sub"])
+        _cell_borders(mc,CLR["borde_o"])
+        for fi,prod in enumerate([p for p in productos if p[6]==cat]):
+            pid,codigo,nombre,precio,costo,stock,categoria = prod
+            bg = CLR["bco"] if fi%2==0 else CLR["fila"]
+            sc = CLR["rojo"] if stock<=5 else CLR["txt"]
+            dr = inv.add_row()
+            vals = [(str(pid),CLR["txt"],False),(codigo,CLR["txt"],False),
+                    (categoria,CLR["mut"],False),(nombre,CLR["txt"],False),
+                    (f"${costo:.2f}",CLR["mut"],False),(f"${precio:.2f}",CLR["txt"],False),
+                    (str(stock),sc,stock<=5),("","",False),("","",False),("","",False)]
+            alns = [WD_ALIGN_PARAGRAPH.CENTER]*3+[WD_ALIGN_PARAGRAPH.LEFT]+\
+                   [WD_ALIGN_PARAGRAPH.CENTER]*5+[WD_ALIGN_PARAGRAPH.LEFT]
+            for j,(v,col,bld) in enumerate(vals):
+                _cell_write(dr.cells[j],v,bold=bld,size=9,
+                            color=col if col else CLR["txt"],align=alns[j],bg=bg)
+                _cell_borders(dr.cells[j],CLR["borde"])
+
+    tr = inv.add_row(); tl = tr.cells[0]
+    for j in range(1,6): tl = tl.merge(tr.cells[j])
+    _cell_write(tl,"TOTAL DE UNIDADES EN SISTEMA:",bold=True,size=9.5,
+                color=CLR["bco"],bg=CLR["bosque"],align=WD_ALIGN_PARAGRAPH.RIGHT)
+    _cell_borders(tl,CLR["borde_o"],5)
+    _cell_write(tr.cells[6],str(total_stock),bold=True,size=10,
+                color=CLR["bco"],bg=CLR["bosque"]); _cell_borders(tr.cells[6],CLR["borde_o"],5)
+    for j in range(7,n):
+        _cell_write(tr.cells[j],"",bg=CLR["fila"]); _cell_borders(tr.cells[j],CLR["borde"])
+    for i,(_,w) in enumerate(COLS): _col_width(inv,i,w)
+
+    # ── Instrucciones ──────────────────────────────────────
+    doc.add_paragraph().paragraph_format.space_after = Pt(6)
+    ti = doc.add_paragraph(); ti.paragraph_format.space_after = Pt(3)
+    ri2 = ti.add_run("INSTRUCCIONES PARA EL LEVANTAMIENTO")
+    ri2.bold=True; ri2.font.size=Pt(10); ri2.font.name="Arial"
+    ri2.font.color.rgb=_rgb(CLR["bosque"])
+    inst = [("1.","Cuenta físicamente cada producto y escribe la cantidad real en STOCK FÍSICO."),
+            ("2.","DIFERENCIA = Stock Sistema − Stock Físico. Negativo = faltante; positivo = sobrante."),
+            ("3.","Registra en OBSERVACIONES productos dañados, vencidos o con discrepancia sin explicación."),
+            ("4.","Al terminar, responsable y supervisor deben firmar al pie de este documento."),
+            ("5.","Conserva este impreso y actualiza los valores en el sistema si corresponde.")]
+    itbl = doc.add_table(rows=len(inst),cols=2); _tbl_fixed(itbl)
+    for i,(num,txt) in enumerate(inst):
+        bg = CLR["fila"] if i%2==0 else CLR["bco"]
+        _cell_write(itbl.rows[i].cells[0],num,bold=True,size=9,color=CLR["bosque"],bg=bg)
+        _cell_write(itbl.rows[i].cells[1],txt,size=9,color=CLR["txt"],
+                    align=WD_ALIGN_PARAGRAPH.LEFT,bg=bg)
+        for c in itbl.rows[i].cells: _cell_borders(c,CLR["borde"])
+    _col_width(itbl,0,0.8); _col_width(itbl,1,25.9)
+
+    # ── Firmas ─────────────────────────────────────────────
+    doc.add_paragraph().paragraph_format.space_after = Pt(14)
+    ftbl = doc.add_table(rows=2,cols=3); _tbl_fixed(ftbl)
+    ftbl.alignment = WD_TABLE_ALIGNMENT.LEFT
+    _no_border = {"top":"none","left":"none","bottom":"none","right":"none"}
+    for j in range(3):
+        c = ftbl.rows[0].cells[j]; _cell_write(c,"",bg=CLR["bco"])
+        tc=c._tc; tcPr=tc.get_or_add_tcPr(); bd=OxmlElement("w:tcBorders")
+        for side,val in _no_border.items():
+            nd=OxmlElement(f"w:{side}"); nd.set(qn("w:val"),val); bd.append(nd)
+        tcPr.append(bd)
+    for j,etiq in enumerate(["Responsable del conteo","","Supervisor / Autoriza"]):
+        c=ftbl.rows[1].cells[j]; tc=c._tc; tcPr=tc.get_or_add_tcPr()
+        bd=OxmlElement("w:tcBorders")
+        for side in ("left","right","bottom"):
+            nd=OxmlElement(f"w:{side}"); nd.set(qn("w:val"),"none"); bd.append(nd)
+        top=OxmlElement("w:top")
+        if etiq:
+            top.set(qn("w:val"),"single"); top.set(qn("w:sz"),"8")
+            top.set(qn("w:color"),CLR["bosque"])
+        else:
+            top.set(qn("w:val"),"none")
+        bd.append(top); tcPr.append(bd)
+        if etiq:
+            p2=c.paragraphs[0]; p2.alignment=WD_ALIGN_PARAGRAPH.CENTER
+            rr3=p2.add_run(etiq); rr3.bold=True; rr3.font.size=Pt(9)
+            rr3.font.name="Arial"; rr3.font.color.rgb=_rgb(CLR["bosque"])
+    _col_width(ftbl,0,11.5); _col_width(ftbl,1,3.5); _col_width(ftbl,2,11.5)
+
+    doc.save(ruta_salida)
 
 # ──────────────────────────────────────────────────────────
 #  COLORES Y ESTILO
 # ──────────────────────────────────────────────────────────
 C = {
-    # Paleta solicitada: Verde Brillante, Verde Hierba, Verde Bosque, Verde Oscuro
-    "bg":        "#4CBB17",   # Verde Brillante: fondo
-    "panel":     "#ffffff",   # Paneles blancos (información)
-    "card":      "#ffffff",   # Tarjetas blancas
+    "bg":        "#4CBB17",
+    "panel":     "#ffffff",
+    "card":      "#ffffff",
     "border":    "#e6f3e8",
-    "accent":    "#48872B",   # Verde Hierba: botones / acentos
-    "accent2":   "#39542C",   # Verde Bosque: acentos secundarios
-    "green":     "#293325",   # Verde Oscuro
+    "accent":    "#48872B",
+    "accent2":   "#39542C",
+    "green":     "#293325",
     "red":       "#e74c3c",
     "yellow":    "#f39c12",
-    "text":      "#062b00",   # Texto oscuro para contraste
+    "text":      "#062b00",
     "muted":     "#6b786e",
     "white":     "#ffffff",
     "hover":     "#a8e39a",
@@ -161,12 +389,10 @@ class PuntoDeVenta(tk.Tk):
         self.geometry("1200x750")
         self.minsize(900, 600)
         self.configure(bg=C["bg"])
-        # Aumentar tamaño de letra por defecto para mejorar legibilidad
         self.option_add("*Font", "Courier 12")
         self.carrito = []
         self._build_ui()
         self._cargar_productos()
-        # Verificar contraseña al arrancar — si no existe, forzar creación
         self.after(200, self._verificar_contrasena_inicial)
 
     # ── UI principal ──────────────────────────────────────
@@ -218,7 +444,6 @@ class PuntoDeVenta(tk.Tk):
     def _show_productos(self):
         self._cargar_tabla_productos()
         self._show_page("productos")
-        # Auto-generar código si el form está vacío (no hay edición activa)
         if not getattr(self, "_editing_id", None):
             cod = self._prod_entries["e_codigo"].get().strip()
             if not cod:
@@ -280,7 +505,6 @@ class PuntoDeVenta(tk.Tk):
                                        style="POS.Treeview", selectmode="browse")
         widths = [80, 260, 90, 70]
         for c, h, w in zip(cols, heads, widths):
-            # Centrar encabezado y contenido; usar anchos fijos para evitar solapamientos
             self.tabla_busq.heading(c, text=h, anchor="center")
             self.tabla_busq.column(c, width=w, anchor="center", stretch=True)
 
@@ -352,12 +576,147 @@ class PuntoDeVenta(tk.Tk):
                                command=self._cobrar_venta)
         btn_cobrar.pack(fill="x", pady=(8,0))
 
+    def _fmt_unidades(self, valor, es_granel=False, con_unidad=False):
+        try:
+            num = float(valor)
+        except (TypeError, ValueError):
+            return "0"
+        if es_granel:
+            txt = f"{num:.3f}".rstrip("0").rstrip(".")
+            if not txt:
+                txt = "0"
+            return f"{txt} kg" if con_unidad else txt
+        return str(int(round(num)))
+
+    def _pedir_cantidad_granel(self, nombre, precio, stock_disponible):
+        dlg = tk.Toplevel(self)
+        dlg.title("Producto a granel")
+        dlg.configure(bg=C["card"])
+        dlg.resizable(False, False)
+        dlg.transient(self)
+        dlg.grab_set()
+        dlg.focus_set()
+        self.update_idletasks()
+        x = self.winfo_x() + (self.winfo_width()  // 2) - 235
+        y = self.winfo_y() + (self.winfo_height() // 2) - 170
+        dlg.geometry(f"470x340+{x}+{y}")
+
+        tk.Label(dlg, text="VENTA A GRANEL", fg=C["accent2"], bg=C["card"],
+                 font=("Courier", 12, "bold")).pack(pady=(16, 4))
+        tk.Label(dlg, text=nombre, fg=C["text"], bg=C["card"],
+                 font=("Courier", 10, "bold"), wraplength=420,
+                 justify="center").pack(pady=(0, 6))
+        tk.Label(
+            dlg,
+            text=f"Precio por kg: ${precio:.2f}   •   Disponible: {self._fmt_unidades(stock_disponible, True, True)}",
+            fg=C["muted"], bg=C["card"], font=("Courier", 9)
+        ).pack()
+        tk.Label(dlg,
+                 text="Captura cantidad o importe. El otro campo se calcula automáticamente.",
+                 fg=C["muted"], bg=C["card"], font=("Courier", 9)).pack(pady=(4, 10))
+
+        body = tk.Frame(dlg, bg=C["card"])
+        body.pack(fill="x", padx=20)
+
+        sv_cantidad = tk.StringVar(value="")
+        sv_importe = tk.StringVar(value="")
+        syncing = {"on": False}
+        resultado = {"cantidad": None}
+
+        def _parse_float(texto):
+            t = texto.strip().replace(",", ".")
+            if not t:
+                return None
+            try:
+                return float(t)
+            except ValueError:
+                return None
+
+        def _set_importe(*_):
+            if syncing["on"]:
+                return
+            cantidad = _parse_float(sv_cantidad.get())
+            if cantidad is None:
+                return
+            syncing["on"] = True
+            sv_importe.set(f"{cantidad * precio:.2f}")
+            syncing["on"] = False
+
+        def _set_cantidad(*_):
+            if syncing["on"] or precio <= 0:
+                return
+            importe = _parse_float(sv_importe.get())
+            if importe is None:
+                return
+            cantidad = round(importe / precio, 3)
+            syncing["on"] = True
+            sv_cantidad.set(self._fmt_unidades(cantidad, True))
+            syncing["on"] = False
+
+        tk.Label(body, text="Cantidad vendida (kg)", fg=C["muted"], bg=C["card"],
+                 font=("Courier", 9)).pack(anchor="w")
+        e_cantidad = tk.Entry(body, textvariable=sv_cantidad,
+                              bg=C["panel"], fg=C["text"],
+                              insertbackground=C["text"], bd=0,
+                              font=("Courier", 12), highlightthickness=1,
+                              highlightbackground=C["border"])
+        e_cantidad.pack(fill="x", ipady=7, pady=(2, 10))
+
+        tk.Label(body, text="Importe a cobrar ($)", fg=C["muted"], bg=C["card"],
+                 font=("Courier", 9)).pack(anchor="w")
+        e_importe = tk.Entry(body, textvariable=sv_importe,
+                             bg=C["panel"], fg=C["text"],
+                             insertbackground=C["text"], bd=0,
+                             font=("Courier", 12), highlightthickness=1,
+                             highlightbackground=C["border"])
+        e_importe.pack(fill="x", ipady=7)
+        e_cantidad.focus()
+
+        sv_cantidad.trace_add("write", _set_importe)
+        sv_importe.trace_add("write", _set_cantidad)
+
+        lbl_error = tk.Label(dlg, text="", fg=C["red"], bg=C["card"],
+                             font=("Courier", 9))
+        lbl_error.pack(pady=(8, 4))
+
+        def _confirmar():
+            cantidad = _parse_float(sv_cantidad.get())
+            if cantidad is None or cantidad <= 0:
+                lbl_error.config(text="Ingresa una cantidad válida mayor a 0.")
+                return
+            if cantidad > stock_disponible + 1e-9:
+                lbl_error.config(
+                    text=f"Stock insuficiente. Máximo: {self._fmt_unidades(stock_disponible, True, True)}"
+                )
+                return
+            resultado["cantidad"] = round(cantidad, 3)
+            dlg.destroy()
+
+        def _cancelar():
+            dlg.destroy()
+
+        btns = tk.Frame(dlg, bg=C["card"])
+        btns.pack(fill="x", padx=20, pady=(2, 12))
+        tk.Button(btns, text="✔ Confirmar", bg=C["green"], fg=C["white"], bd=0,
+                  font=("Courier", 10, "bold"), pady=8, cursor="hand2",
+                  activebackground="#27ae60",
+                  command=_confirmar).pack(side="left", fill="x", expand=True, padx=(0, 4))
+        tk.Button(btns, text="✕ Cancelar", bg=C["panel"], fg=C["muted"], bd=0,
+                  font=("Courier", 10), pady=8, cursor="hand2",
+                  command=_cancelar).pack(side="left", fill="x", expand=True)
+
+        dlg.bind("<Return>", lambda e: _confirmar())
+        dlg.bind("<Escape>", lambda e: _cancelar())
+        dlg.protocol("WM_DELETE_WINDOW", _cancelar)
+        self.wait_window(dlg)
+        return resultado["cantidad"]
+
     # ── Lógica de búsqueda ────────────────────────────────
     def _cargar_productos(self):
         self._productos_cache = []
         with get_conn() as conn:
             rows = conn.execute(
-                "SELECT id,codigo,nombre,precio,costo,stock FROM productos ORDER BY nombre"
+                "SELECT id,codigo,nombre,precio,costo,stock,a_granel FROM productos ORDER BY nombre"
             ).fetchall()
         self._productos_cache = rows
         self._filtrar_productos()
@@ -367,11 +726,12 @@ class PuntoDeVenta(tk.Tk):
         for row in self.tabla_busq.get_children():
             self.tabla_busq.delete(row)
         for prod in self._productos_cache:
-            pid, codigo, nombre, precio, costo, stock = prod
+            pid, codigo, nombre, precio, costo, stock, a_granel = prod
             if q in codigo.lower() or q in nombre.lower():
                 tag = "low" if stock <= 5 else ""
+                stock_txt = self._fmt_unidades(stock, bool(a_granel), bool(a_granel))
                 self.tabla_busq.insert("", "end",
-                    values=(codigo, nombre, f"${precio:.2f}", stock),
+                    values=(codigo, nombre, f"${precio:.2f}", stock_txt),
                     iid=str(pid), tags=(tag,))
         self.tabla_busq.tag_configure("low", foreground=C["yellow"])
 
@@ -397,16 +757,40 @@ class PuntoDeVenta(tk.Tk):
         prod = next((p for p in self._productos_cache if p[0] == pid), None)
         if not prod:
             return
-        pid, codigo, nombre, precio, costo, stock = prod
+        pid, codigo, nombre, precio, costo, stock, a_granel = prod
+        es_granel = bool(a_granel)
         if stock <= 0:
             messagebox.showwarning("Sin stock",
                 f'"{nombre}" no tiene stock disponible.', parent=self)
             return
+        item_existente = next((i for i in self.carrito if i["id"] == pid), None)
+        if es_granel:
+            ya_en_carrito = item_existente["cantidad"] if item_existente else 0
+            stock_disponible = round(stock - ya_en_carrito, 3)
+            if stock_disponible <= 0:
+                messagebox.showwarning("Stock insuficiente",
+                    f'Stock máximo: {self._fmt_unidades(stock, True, True)}', parent=self)
+                return
+            cantidad = self._pedir_cantidad_granel(nombre, precio, stock_disponible)
+            if cantidad is None:
+                return
+            if item_existente:
+                item_existente["cantidad"] = round(item_existente["cantidad"] + cantidad, 3)
+            else:
+                self.carrito.append({
+                    "id": pid, "codigo": codigo, "nombre": nombre,
+                    "precio": precio, "costo": costo, "cantidad": cantidad,
+                    "stock": stock, "es_granel": True
+                })
+            self._refresh_carrito()
+            self.sv_busqueda.set("")
+            return
+
         for item in self.carrito:
             if item["id"] == pid:
                 if item["cantidad"] >= stock:
                     messagebox.showwarning("Stock insuficiente",
-                        f'Stock máximo: {stock}', parent=self)
+                        f'Stock máximo: {self._fmt_unidades(stock)}', parent=self)
                     return
                 item["cantidad"] += 1
                 self._refresh_carrito()
@@ -414,7 +798,7 @@ class PuntoDeVenta(tk.Tk):
                 return
         self.carrito.append({"id": pid, "codigo": codigo, "nombre": nombre,
                               "precio": precio, "costo": costo,
-                              "cantidad": 1, "stock": stock})
+                              "cantidad": 1, "stock": stock, "es_granel": False})
         self._refresh_carrito()
         self.sv_busqueda.set("")
 
@@ -425,7 +809,9 @@ class PuntoDeVenta(tk.Tk):
         for i, item in enumerate(self.carrito):
             sub = item["precio"] * item["cantidad"]
             total += sub
-            line = f"  {item['nombre'][:22]:<22}  x{item['cantidad']}  ${sub:.2f}"
+            es_granel = bool(item.get("es_granel", False))
+            cant_txt = self._fmt_unidades(item["cantidad"], es_granel, es_granel)
+            line = f"  {item['nombre'][:22]:<22}  x{cant_txt}  ${sub:.2f}"
             self.lista_carrito.insert("end", line)
             if i % 2 == 0:
                 self.lista_carrito.itemconfig(i, bg=C["card"])
@@ -468,10 +854,11 @@ class PuntoDeVenta(tk.Tk):
                 ganancia = (item["precio"] - item["costo"]) * item["cantidad"]
                 conn.execute(
                     "INSERT INTO detalle_venta"
-                    " (venta_id,producto_id,nombre,precio,costo,cantidad,subtotal,ganancia)"
-                    " VALUES (?,?,?,?,?,?,?,?)",
+                    " (venta_id,producto_id,nombre,precio,costo,cantidad,subtotal,ganancia,es_granel)"
+                    " VALUES (?,?,?,?,?,?,?,?,?)",
                     (venta_id, item["id"], item["nombre"],
-                     item["precio"], item["costo"], item["cantidad"], sub, ganancia))
+                     item["precio"], item["costo"], item["cantidad"], sub, ganancia,
+                     int(bool(item.get("es_granel", False)))))
                 conn.execute("UPDATE productos SET stock = stock - ? WHERE id = ?",
                              (item["cantidad"], item["id"]))
         messagebox.showinfo("✔ Venta registrada",
@@ -497,6 +884,14 @@ class PuntoDeVenta(tk.Tk):
         fields = [("Código", "e_codigo"), ("Nombre", "e_nombre"),
                   ("Costo $", "e_costo"), ("Precio venta $", "e_precio"),
                   ("Stock", "e_stock"), ("Categoría", "e_categoria")]
+        entry_widths = {
+            "e_codigo": 12,
+            "e_nombre": 30,
+            "e_costo": 8,
+            "e_precio": 10,
+            "e_stock": 7,
+            "e_categoria": 16,
+        }
         self._prod_entries = {}
         for col, (lbl, key) in enumerate(fields):
             color_lbl = C["yellow"] if key == "e_costo" else C["muted"]
@@ -504,13 +899,12 @@ class PuntoDeVenta(tk.Tk):
                      font=("Courier", 9)).grid(row=1, column=col, padx=(0,4), sticky="w")
 
             if key == "e_codigo":
-                # Campo Código: entry + botón ⟳ en un sub-frame
                 wrap = tk.Frame(form_card, bg=C["card"])
                 wrap.grid(row=2, column=col, padx=(0,8), sticky="ew")
                 ent = tk.Entry(wrap, bg=C["panel"], fg=C["text"],
                                insertbackground=C["text"], bd=0, font=("Courier", 11),
                                highlightbackground=C["border"], highlightthickness=1,
-                               width=12)
+                               width=entry_widths[key])
                 ent.pack(side="left", fill="x", expand=True, ipady=6)
                 tk.Button(wrap, text="⟳", bg=C["accent2"], fg=C["white"],
                           bd=0, font=("Courier", 10), padx=5, cursor="hand2",
@@ -520,15 +914,35 @@ class PuntoDeVenta(tk.Tk):
                 ent = tk.Entry(form_card, bg=C["panel"], fg=C["text"],
                                insertbackground=C["text"], bd=0, font=("Courier", 11),
                                highlightbackground=C["border"], highlightthickness=1,
-                               width=12)
+                               width=entry_widths[key])
                 ent.grid(row=2, column=col, padx=(0,8), ipady=6, sticky="ew")
 
             self._prod_entries[key] = ent
-        form_card.columnconfigure(1, weight=1)
+        form_card.columnconfigure(0, weight=2, minsize=120)   # Código
+        form_card.columnconfigure(1, weight=7, minsize=300)   # Nombre
+        form_card.columnconfigure(2, weight=2, minsize=95)    # Costo
+        form_card.columnconfigure(3, weight=2, minsize=110)   # Precio
+        form_card.columnconfigure(4, weight=1, minsize=85)    # Stock
+        form_card.columnconfigure(5, weight=3, minsize=160)   # Categoría
+        self.sv_es_granel = tk.BooleanVar(value=False)
+        tk.Checkbutton(
+            form_card,
+            text="¿Producto a granel? (stock decimal en kg)",
+            variable=self.sv_es_granel,
+            onvalue=True,
+            offvalue=False,
+            bg=C["card"],
+            fg=C["text"],
+            selectcolor=C["panel"],
+            activebackground=C["card"],
+            activeforeground=C["text"],
+            font=("Courier", 9),
+            highlightthickness=0,
+            bd=0
+        ).grid(row=3, column=0, columnspan=6, sticky="w", pady=(10, 0))
 
         btn_frame = tk.Frame(form_card, bg=C["card"])
-        btn_frame.grid(row=2, column=6, padx=(8,0), sticky="e")
-        # Nuevo: botón para crear un producto nuevo (limpia campos y genera código único)
+        btn_frame.grid(row=4, column=0, columnspan=6, pady=(10,0), sticky="e")
         tk.Button(btn_frame, text="● Producto nuevo", bg=C["accent2"], fg=C["white"],
               bd=0, font=("Courier", 10), padx=12, pady=6, cursor="hand2",
               activebackground="#6a4aaf",
@@ -539,11 +953,15 @@ class PuntoDeVenta(tk.Tk):
               command=self._guardar_producto).pack(side="left", padx=(0,4))
         tk.Button(btn_frame, text="✕ Eliminar", bg=C["red"], fg=C["white"],
               bd=0, font=("Courier", 10), padx=12, pady=6, cursor="hand2",
-              command=self._eliminar_producto).pack(side="left")
+              command=self._eliminar_producto).pack(side="left", padx=(0,4))
+        tk.Button(btn_frame, text="📋 Inventario Físico", bg=C["green"], fg=C["white"],
+              bd=0, font=("Courier", 10, "bold"), padx=12, pady=6, cursor="hand2",
+              activebackground="#1a4a10",
+              command=self._exportar_inventario_docx).pack(side="left")
 
-        cols = ("id","codigo","nombre","costo","precio","stock","categoria")
-        heads = ("ID","Código","Nombre","Costo","Precio venta","Stock","Categoría")
-        widths = [40,80,190,70,80,60,90]
+        cols = ("id","codigo","nombre","costo","precio","stock","categoria","granel")
+        heads = ("ID","Código","Nombre","Costo","Precio venta","Stock","Categoría","A granel")
+        widths = [40,80,190,70,80,70,90,75]
 
         frame_t = tk.Frame(page, bg=C["bg"])
         frame_t.pack(fill="both", expand=True)
@@ -551,7 +969,6 @@ class PuntoDeVenta(tk.Tk):
         self.tabla_prod = ttk.Treeview(frame_t, columns=cols, show="headings",
                                        style="POS.Treeview", selectmode="browse")
         for c,h,w in zip(cols,heads,widths):
-            # Centrar encabezado y contenido; usar anchos fijos
             self.tabla_prod.heading(c, text=h, anchor="center")
             self.tabla_prod.column(c, width=w, anchor="center", stretch=True)
         sb = ttk.Scrollbar(frame_t, orient="vertical",
@@ -587,13 +1004,16 @@ class PuntoDeVenta(tk.Tk):
             self.tabla_prod.delete(row)
         with get_conn() as conn:
             rows = conn.execute(
-                "SELECT id,codigo,nombre,costo,precio,stock,categoria FROM productos ORDER BY nombre"
+                "SELECT id,codigo,nombre,costo,precio,stock,categoria,a_granel"
+                " FROM productos ORDER BY nombre"
             ).fetchall()
         for r in rows:
             if q in r[1].lower() or q in r[2].lower():
                 tag = "low" if r[5] <= 5 else ""
+                stock_txt = self._fmt_unidades(r[5], bool(r[7]), bool(r[7]))
                 self.tabla_prod.insert("", "end",
-                    values=(r[0],r[1],r[2],f"${r[3]:.2f}",f"${r[4]:.2f}",r[5],r[6]),
+                    values=(r[0],r[1],r[2],f"${r[3]:.2f}",f"${r[4]:.2f}",stock_txt,r[6],
+                            "Sí" if r[7] else "No"),
                     iid=str(r[0]), tags=(tag,))
         self.tabla_prod.tag_configure("low", foreground=C["yellow"])
 
@@ -602,50 +1022,65 @@ class PuntoDeVenta(tk.Tk):
         if not sel:
             return
         vals = self.tabla_prod.item(sel[0], "values")
-        pid, codigo, nombre, costo, precio, stock, cat = vals
+        pid, codigo, nombre, costo, precio, stock, cat, granel = vals
         costo = costo.replace("$","")
         precio = precio.replace("$","")
+        stock = str(stock).replace("kg", "").replace("KG", "").strip()
         keys = ("e_codigo","e_nombre","e_costo","e_precio","e_stock","e_categoria")
         datos = (codigo, nombre, costo, precio, stock, cat)
         for k,d in zip(keys, datos):
             self._prod_entries[k].delete(0,"end")
             self._prod_entries[k].insert(0, d)
+        self.sv_es_granel.set(str(granel).strip().lower() in ("sí", "si", "1", "true"))
         self._editing_id = int(pid)
 
     def _guardar_producto(self):
         try:
             codigo   = self._prod_entries["e_codigo"].get().strip()
             nombre   = self._prod_entries["e_nombre"].get().strip()
-            costo    = float(self._prod_entries["e_costo"].get().strip() or 0)
-            precio   = float(self._prod_entries["e_precio"].get().strip())
-            stock    = int(self._prod_entries["e_stock"].get().strip())
+            costo    = float((self._prod_entries["e_costo"].get().strip() or "0").replace(",", "."))
+            precio   = float(self._prod_entries["e_precio"].get().strip().replace(",", "."))
+            stock_txt = self._prod_entries["e_stock"].get().strip()
             categoria= self._prod_entries["e_categoria"].get().strip() or "General"
         except ValueError:
             messagebox.showerror("Error",
-                "Costo y Precio deben ser números. Stock debe ser entero.",
+                "Costo y Precio deben ser números válidos.",
                 parent=self)
+            return
+        es_granel = bool(self.sv_es_granel.get())
+        try:
+            if es_granel:
+                stock = float(stock_txt.replace(",", "."))
+            else:
+                stock = int(stock_txt)
+        except ValueError:
+            messagebox.showerror(
+                "Error",
+                "Stock debe ser decimal en kg si es a granel, o entero si no es a granel.",
+                parent=self
+            )
             return
         if not codigo or not nombre:
             messagebox.showerror("Error", "Código y Nombre son obligatorios.", parent=self)
             return
-        if costo < 0 or precio < 0:
-            messagebox.showerror("Error", "Costo y Precio no pueden ser negativos.", parent=self)
+        if costo < 0 or precio < 0 or stock < 0:
+            messagebox.showerror("Error", "Costo, Precio y Stock no pueden ser negativos.", parent=self)
             return
 
         eid = getattr(self, "_editing_id", None)
         with get_conn() as conn:
             if eid:
                 conn.execute(
-                    "UPDATE productos SET codigo=?,nombre=?,costo=?,precio=?,stock=?,categoria=?"
+                    "UPDATE productos SET codigo=?,nombre=?,costo=?,precio=?,stock=?,categoria=?,a_granel=?"
                     " WHERE id=?",
-                    (codigo, nombre, costo, precio, stock, categoria, eid))
+                    (codigo, nombre, costo, precio, stock, categoria, int(es_granel), eid))
                 msg = "Producto actualizado."
             else:
                 try:
                     conn.execute(
-                        "INSERT INTO productos (codigo,nombre,costo,precio,stock,categoria)"
-                        " VALUES (?,?,?,?,?,?)",
-                        (codigo, nombre, costo, precio, stock, categoria))
+                        "INSERT INTO productos (codigo,nombre,costo,precio,stock,categoria,a_granel)"
+                        " VALUES (?,?,?,?,?,?,?)",
+                        (codigo, nombre, costo, precio, stock, categoria, int(es_granel)))
                     msg = "Producto agregado."
                 except sqlite3.IntegrityError:
                     messagebox.showerror("Error",
@@ -654,8 +1089,9 @@ class PuntoDeVenta(tk.Tk):
         messagebox.showinfo("OK", msg, parent=self)
         for e in self._prod_entries.values():
             e.delete(0,"end")
+        self.sv_es_granel.set(False)
         self._editing_id = None
-        self._autocodigo()           # pre-cargar código para el siguiente producto
+        self._autocodigo()
         self._cargar_tabla_productos()
         self._cargar_productos()
 
@@ -674,17 +1110,11 @@ class PuntoDeVenta(tk.Tk):
             for e in self._prod_entries.values():
                 e.delete(0,"end")
             self._editing_id = None
-            self._autocodigo()       # pre-cargar código para el siguiente producto
+            self._autocodigo()
             self._cargar_tabla_productos()
             self._cargar_productos()
 
     def _autocodigo(self):
-        """
-        Genera un código único y lo coloca en el campo Código del formulario.
-        Solo actúa cuando NO se está editando un producto existente,
-        para no pisar el código real de un producto cargado.
-        """
-        # Si hay un producto seleccionado para edición, no tocar el campo
         if getattr(self, "_editing_id", None):
             return
         codigo = _generar_codigo_unico()
@@ -693,28 +1123,68 @@ class PuntoDeVenta(tk.Tk):
         e.insert(0, codigo)
 
     def _limpiar_form_producto(self):
-        """
-        Limpia todos los campos del formulario de producto y cancela cualquier edición.
-        El botón de flecha debe usar esta acción para vaciar código y datos.
-        """
         for k, ent in self._prod_entries.items():
             ent.delete(0, "end")
+        self.sv_es_granel.set(False)
         self._editing_id = None
 
     def _nuevo_producto(self):
-        """
-        Preparar formulario para un producto nuevo: limpiar campos y generar
-        un código único verificando que no exista en la base de datos.
-        """
-        # Asegurarse de no estar en modo edición
         self._editing_id = None
         for ent in self._prod_entries.values():
             ent.delete(0, "end")
-        # Genera y escribe un código único
+        self.sv_es_granel.set(False)
         self._autocodigo()
-        # Poner foco en el nombre para facilitar entrada
         if "e_nombre" in self._prod_entries:
             self._prod_entries["e_nombre"].focus()
+
+    def _exportar_inventario_docx(self):
+        """Genera el .docx de inventario físico con los datos actuales de la BD
+        y lo guarda en la carpeta 'documentos para inventarios fisicos'."""
+        # Capa 1: dependencia
+        if not _DOCX_OK:
+            messagebox.showerror("Dependencia faltante",
+                "La librería 'python-docx' no está instalada.\n\n"
+                "Instálala con:\n    pip install python-docx", parent=self)
+            return
+        # Capa 2: leer BD
+        try:
+            with get_conn() as conn:
+                productos = conn.execute(
+                    "SELECT id,codigo,nombre,precio,costo,stock,categoria"
+                    " FROM productos ORDER BY categoria, nombre"
+                ).fetchall()
+        except sqlite3.Error as e:
+            messagebox.showerror("Error de base de datos",
+                f"No se pudo leer la tabla de productos:\n{e}", parent=self)
+            return
+        if not productos:
+            messagebox.showinfo("Sin productos",
+                "No hay productos registrados en la base de datos.", parent=self)
+            return
+        # Capa 3: crear carpeta
+        base = os.path.dirname(os.path.abspath(__file__))
+        carpeta = os.path.join(base, "documentos para inventarios fisicos")
+        try:
+            os.makedirs(carpeta, exist_ok=True)
+        except OSError as e:
+            messagebox.showerror("Error al crear carpeta",
+                f"No se pudo crear la carpeta de destino:\n{carpeta}\n\nDetalle: {e}",
+                parent=self)
+            return
+        # Capa 4: generar archivo
+        ts = datetime.datetime.now().strftime("%Y%m%d_%H%M%S")
+        ruta = os.path.join(carpeta, f"inventario_fisico_{ts}.docx")
+        try:
+            generar_docx_inventario(productos, ruta)
+        except Exception as e:
+            messagebox.showerror("Error al generar el documento",
+                f"Ocurrió un problema al crear el archivo .docx:\n{e}", parent=self)
+            return
+        # Capa 5: notificar
+        messagebox.showinfo("✔ Inventario generado",
+            f"Documento creado correctamente.\n\n"
+            f"Productos incluidos: {len(productos)}\n"
+            f"Guardado en:\n{ruta}", parent=self)
 
     # ══════════════════════════════════════════════════════
     #  PÁGINA: HISTORIAL
@@ -723,7 +1193,6 @@ class PuntoDeVenta(tk.Tk):
         page = tk.Frame(self.content, bg=C["bg"])
         self.pages["historial"] = page
 
-        # Filtro fecha
         filter_f = tk.Frame(page, bg=C["card"], padx=12, pady=10)
         filter_f.pack(fill="x", pady=(0,10))
         tk.Label(filter_f, text="Filtrar por fecha (YYYY-MM-DD):", fg=C["muted"],
@@ -735,35 +1204,30 @@ class PuntoDeVenta(tk.Tk):
                  bd=0, font=("Courier",11), width=14, highlightthickness=1,
                  highlightbackground=C["border"]).pack(side="left", padx=8, ipady=5)
 
-        # Botón eliminar venta (con candado) — alineado a la derecha en la misma barra
         tk.Button(filter_f, text="🗑  Eliminar venta seleccionada",
                   bg=C["red"], fg=C["white"], bd=0,
                   font=("Courier", 10, "bold"), padx=14, pady=4, cursor="hand2",
                   activebackground="#c0392b",
                   command=self._eliminar_venta_protegida).pack(side="right")
 
-        # Botón cambiar contraseña
         tk.Button(filter_f, text="🔑  Cambiar contraseña",
                   bg=C["accent2"], fg=C["white"], bd=0,
                   font=("Courier", 10), padx=12, pady=4, cursor="hand2",
                   activebackground="#6a4aaf",
                   command=self._cambiar_contrasena).pack(side="right", padx=(0,8))
-        
-        # Botón Exportar CSV
+
         tk.Button(filter_f, text="💾  Exportar CSV",
                   bg=C["accent"], fg=C["white"], bd=0,
                   font=("Courier", 10, "bold"), padx=12, pady=4, cursor="hand2",
                   activebackground="#3a7de0",
                   command=self._exportar_csv).pack(side="right", padx=(0,8))
-     
-        # KPIs
+
         self.kpi_frame = tk.Frame(page, bg=C["bg"])
         self.kpi_frame.pack(fill="x", pady=(0,10))
         self.kpi_ventas   = self._kpi_box(self.kpi_frame, "VENTAS HOY",   "0",      C["accent"])
         self.kpi_total    = self._kpi_box(self.kpi_frame, "TOTAL HOY",    "$0.00",  C["green"])
         self.kpi_ganancia = self._kpi_box(self.kpi_frame, "GANANCIA HOY", "$0.00",  C["yellow"])
 
-        # Tabla historial ventas
         cols_v = ("id","fecha","total")
         fr1 = tk.Frame(page, bg=C["bg"])
         fr1.pack(fill="both", expand=True)
@@ -780,7 +1244,6 @@ class PuntoDeVenta(tk.Tk):
         self.tabla_hist = ttk.Treeview(left_h, columns=cols_v, show="headings",
                                        style="POS.Treeview", height=8)
         for c,h,w in zip(cols_v,("ID","Fecha","Total"),(40,150,80)):
-            # Centrar encabezado y contenido; usar anchos fijos para evitar overflow
             self.tabla_hist.heading(c, text=h, anchor="center")
             self.tabla_hist.column(c, width=w, anchor="center", stretch=True)
         sb = ttk.Scrollbar(left_h, orient="vertical", command=self.tabla_hist.yview)
@@ -789,7 +1252,6 @@ class PuntoDeVenta(tk.Tk):
         sb.pack(side="right", fill="y")
         self.tabla_hist.bind("<<TreeviewSelect>>", self._ver_detalle_venta)
 
-        # Detalle venta
         right_h = tk.Frame(split, bg=C["card"], padx=12, pady=12, width=480)
         right_h.pack(side="right", fill="y")
         right_h.pack_propagate(False)
@@ -803,12 +1265,10 @@ class PuntoDeVenta(tk.Tk):
         for c,h,w in zip(("nombre","cant","precio","sub","ganancia"),
                           ("Producto","Cant","Precio","Subtotal","Ganancia"),
                           (140,50,85,90,90)):
-            # Centrar encabezado y contenido para que no sobresalgan
             self.tabla_det.heading(c, text=h, anchor="center")
             self.tabla_det.column(c, width=w, anchor="center", stretch=False)
         self.tabla_det.pack(fill="both", expand=True)
 
-        # Evitar que el usuario redimensione las cabeceras arrastrando el separador
         def _block_resize(event, tv):
             if tv.identify_region(event.x, event.y) == "separator":
                 return "break"
@@ -867,62 +1327,44 @@ class PuntoDeVenta(tk.Tk):
             self.tabla_det.delete(row)
         with get_conn() as conn:
             rows = conn.execute(
-                "SELECT nombre,cantidad,precio,subtotal,ganancia FROM detalle_venta"
+                "SELECT nombre,cantidad,precio,subtotal,ganancia,es_granel FROM detalle_venta"
                 " WHERE venta_id=?", (vid,)).fetchall()
         for r in rows:
+            cant_txt = self._fmt_unidades(r[1], bool(r[5]), bool(r[5]))
             self.tabla_det.insert("","end",
-                values=(r[0],r[1],f"${r[2]:.2f}",f"${r[3]:.2f}",f"${r[4]:.2f}"))
+                values=(r[0],cant_txt,f"${r[2]:.2f}",f"${r[3]:.2f}",f"${r[4]:.2f}"))
+
     def _exportar_csv(self):
-        """
-        Consulta la base de datos y exporta todas las ventas con sus detalles
-        a un archivo CSV dentro de la carpeta 'respaldos_csv'.
-        """
-        # 1. Definir la carpeta donde se guardarán los archivos y crearla si no existe
         carpeta_base = os.path.dirname(os.path.abspath(__file__))
         carpeta_respaldos = os.path.join(carpeta_base, "respaldos_csv")
         os.makedirs(carpeta_respaldos, exist_ok=True)
-
-        # 2. Generar un nombre de archivo único usando la fecha y hora actual
         fecha_str = datetime.datetime.now().strftime("%Y%m%d_%H%M%S")
         nombre_archivo = f"historial_ventas_{fecha_str}.csv"
         ruta_completa = os.path.join(carpeta_respaldos, nombre_archivo)
-
         try:
-            # 3. Consultar la base de datos
             with get_conn() as conn:
                 cursor = conn.cursor()
-                # Hacemos un JOIN para obtener los datos de la venta y los productos vendidos
                 cursor.execute("""
-                    SELECT v.id, v.fecha, v.total, 
+                    SELECT v.id, v.fecha, v.total,
                            dv.nombre, dv.cantidad, dv.precio, dv.subtotal, dv.ganancia
                     FROM ventas v
                     LEFT JOIN detalle_venta dv ON v.id = dv.venta_id
                     ORDER BY v.id DESC
                 """)
                 filas = cursor.fetchall()
-
-            # 4. Escribir los datos en el archivo CSV
             with open(ruta_completa, mode="w", newline="", encoding="utf-8") as archivo_csv:
                 escritor = csv.writer(archivo_csv)
-        
-                # Escribir la fila de encabezados
                 escritor.writerow([
-                    "ID_Venta", "Fecha_Venta", "Total_Venta", 
+                    "ID_Venta", "Fecha_Venta", "Total_Venta",
                     "Producto", "Cantidad", "Precio_Unitario", "Subtotal_Producto", "Ganancia_Producto"
                 ])
-        
-                # Escribir todas las filas obtenidas de la base de datos
                 escritor.writerows(filas)
-
-            # 5. Mostrar mensaje de éxito al usuario
             messagebox.showinfo(
                 "✔ Exportación exitosa",
                 f"El historial se ha exportado correctamente.\n\nArchivo guardado en:\n{ruta_completa}",
                 parent=self
             )
-
         except Exception as e:
-            # Manejo de errores por si falla la escritura o la consulta
             messagebox.showerror(
                 "Error de exportación",
                 f"Ocurrió un problema al exportar el archivo CSV:\n{str(e)}",
@@ -934,36 +1376,27 @@ class PuntoDeVenta(tk.Tk):
     # ══════════════════════════════════════════════════════
     def _verificar_contrasena_inicial(self):
         if get_admin_hash() is not None:
-            return  # Ya existe contraseña → todo en orden, continuar normalmente
-
-        # No hay contraseña: mostrar diálogo de creación obligatorio
+            return
         dlg = tk.Toplevel(self)
         dlg.title("🔐 Crear contraseña de administrador")
         dlg.configure(bg=C["card"])
         dlg.resizable(False, False)
         dlg.grab_set()
         dlg.focus_set()
-
-        # No se puede cerrar con la X hasta crear la contraseña
         dlg.protocol("WM_DELETE_WINDOW", lambda: None)
-
         self.update_idletasks()
         x = self.winfo_x() + (self.winfo_width()  // 2) - 240
         y = self.winfo_y() + (self.winfo_height() // 2) - 160
         dlg.geometry(f"480x320+{x}+{y}")
-
         tk.Label(dlg, text="🔐  PRIMERA CONFIGURACIÓN",
                  fg=C["accent"], bg=C["card"],
                  font=("Courier", 12, "bold")).pack(pady=(22, 4))
         tk.Label(dlg, text="Crea la contraseña de administrador para proteger\nla eliminación de ventas. Guárdala en un lugar seguro.",
                  fg=C["text"], bg=C["card"],
                  font=("Courier", 9), justify="center").pack(pady=(0, 14))
-
         tk.Frame(dlg, bg=C["border"], height=1).pack(fill="x", padx=20, pady=(0, 14))
-
         fields_frame = tk.Frame(dlg, bg=C["card"])
         fields_frame.pack(padx=30, fill="x")
-
         tk.Label(fields_frame, text="Nueva contraseña:", fg=C["muted"],
                  bg=C["card"], font=("Courier", 9)).pack(anchor="w")
         sv_nueva = tk.StringVar()
@@ -973,7 +1406,6 @@ class PuntoDeVenta(tk.Tk):
                            highlightbackground=C["border"])
         e_nueva.pack(fill="x", ipady=7, pady=(2, 10))
         e_nueva.focus()
-
         tk.Label(fields_frame, text="Confirmar contraseña:", fg=C["muted"],
                  bg=C["card"], font=("Courier", 9)).pack(anchor="w")
         sv_conf = tk.StringVar()
@@ -982,16 +1414,12 @@ class PuntoDeVenta(tk.Tk):
                           bd=0, font=("Courier", 12), highlightthickness=1,
                           highlightbackground=C["border"])
         e_conf.pack(fill="x", ipady=7, pady=(2, 0))
-
         lbl_error = tk.Label(dlg, text="", fg=C["red"], bg=C["card"],
                              font=("Courier", 9))
         lbl_error.pack(pady=(6, 0))
-
         def _guardar():
             nueva = sv_nueva.get()
             conf  = sv_conf.get()
-
-            # Validaciones antes de guardar
             if not nueva:
                 lbl_error.config(text="✕ La contraseña no puede estar vacía.")
                 return
@@ -1003,16 +1431,13 @@ class PuntoDeVenta(tk.Tk):
                 sv_conf.set("")
                 e_conf.focus()
                 return
-
             set_admin_hash(_hash(nueva))
             dlg.destroy()
             messagebox.showinfo("✔ Contraseña creada",
                 "Contraseña de administrador guardada correctamente.\n"
                 "Recuérdala: la necesitarás para eliminar ventas.", parent=self)
-
         e_conf.bind("<Return>", lambda e: _guardar())
         e_nueva.bind("<Return>", lambda e: e_conf.focus())
-
         tk.Button(dlg, text="✔  Guardar contraseña",
                   bg=C["green"], fg=C["white"], bd=0,
                   font=("Courier", 11, "bold"), pady=10, cursor="hand2",
@@ -1020,19 +1445,9 @@ class PuntoDeVenta(tk.Tk):
                   command=_guardar).pack(fill="x", padx=30, pady=(12, 0))
 
     def _cambiar_contrasena(self):
-        """
-        Flujo para cambiar la contraseña:
-          1. Pedir contraseña ACTUAL y validar
-          2. Pedir contraseña NUEVA con confirmación
-          3. Guardar nuevo hash en BD
-
-        Si no existe contraseña aún, redirige al flujo de creación.
-        """
         if get_admin_hash() is None:
-            # Caso borde: el usuario llega aquí sin haber creado contraseña aún
             self._verificar_contrasena_inicial()
             return
-
         dlg = tk.Toplevel(self)
         dlg.title("🔑 Cambiar contraseña de administrador")
         dlg.configure(bg=C["card"])
@@ -1040,24 +1455,19 @@ class PuntoDeVenta(tk.Tk):
         dlg.grab_set()
         dlg.focus_set()
         dlg.protocol("WM_DELETE_WINDOW", dlg.destroy)
-
         self.update_idletasks()
         x = self.winfo_x() + (self.winfo_width()  // 2) - 240
         y = self.winfo_y() + (self.winfo_height() // 2) - 180
         dlg.geometry(f"480x360+{x}+{y}")
-
         tk.Label(dlg, text="🔑  CAMBIAR CONTRASEÑA",
                  fg=C["accent2"], bg=C["card"],
                  font=("Courier", 12, "bold")).pack(pady=(22, 4))
         tk.Label(dlg, text="Debes ingresar tu contraseña actual antes de establecer una nueva.",
                  fg=C["muted"], bg=C["card"],
                  font=("Courier", 9), justify="center").pack(pady=(0, 12))
-
         tk.Frame(dlg, bg=C["border"], height=1).pack(fill="x", padx=20, pady=(0, 14))
-
         ff = tk.Frame(dlg, bg=C["card"])
         ff.pack(padx=30, fill="x")
-
         def _campo(parent, label, sv):
             tk.Label(parent, text=label, fg=C["muted"], bg=C["card"],
                      font=("Courier", 9)).pack(anchor="w")
@@ -1067,33 +1477,24 @@ class PuntoDeVenta(tk.Tk):
                            highlightbackground=C["border"])
             ent.pack(fill="x", ipady=7, pady=(2, 10))
             return ent
-
         sv_actual = tk.StringVar()
         sv_nueva  = tk.StringVar()
         sv_conf   = tk.StringVar()
-
         e_actual = _campo(ff, "Contraseña actual:", sv_actual)
         e_nueva  = _campo(ff, "Nueva contraseña:", sv_nueva)
         e_conf   = _campo(ff, "Confirmar nueva contraseña:", sv_conf)
         e_actual.focus()
-
         lbl_error = tk.Label(dlg, text="", fg=C["red"], bg=C["card"],
                              font=("Courier", 9))
         lbl_error.pack(pady=(0, 4))
-
-        intentos_actuales = [0]  # Lista mutable para modificar desde closure
-
+        intentos_actuales = [0]
         def _guardar():
             actual = sv_actual.get()
             nueva  = sv_nueva.get()
             conf   = sv_conf.get()
-
-            # Capa 1: campos vacíos
             if not actual or not nueva or not conf:
                 lbl_error.config(text="✕ Todos los campos son obligatorios.")
                 return
-
-            # Capa 2: validar contraseña actual con hash (máx 3 intentos)
             intentos_actuales[0] += 1
             if _hash(actual) != get_admin_hash():
                 restantes = 3 - intentos_actuales[0]
@@ -1108,8 +1509,6 @@ class PuntoDeVenta(tk.Tk):
                 sv_actual.set("")
                 e_actual.focus()
                 return
-
-            # Capa 3: validar nueva contraseña
             if len(nueva) < 4:
                 lbl_error.config(text="✕ La nueva contraseña debe tener al menos 4 caracteres.")
                 return
@@ -1121,17 +1520,13 @@ class PuntoDeVenta(tk.Tk):
             if _hash(nueva) == get_admin_hash():
                 lbl_error.config(text="✕ La nueva contraseña es igual a la actual.")
                 return
-
-            # Todo OK: guardar nuevo hash
             set_admin_hash(_hash(nueva))
             dlg.destroy()
             messagebox.showinfo("✔ Contraseña actualizada",
                 "La contraseña de administrador fue cambiada exitosamente.", parent=self)
-
         e_actual.bind("<Return>", lambda e: e_nueva.focus())
         e_nueva.bind("<Return>",  lambda e: e_conf.focus())
         e_conf.bind("<Return>",   lambda e: _guardar())
-
         btn_f = tk.Frame(dlg, bg=C["card"])
         btn_f.pack(padx=30, fill="x", pady=(4, 0))
         tk.Button(btn_f, text="✔  Guardar cambios", bg=C["accent2"], fg=C["white"],
@@ -1145,19 +1540,6 @@ class PuntoDeVenta(tk.Tk):
     #  ELIMINAR VENTA CON CONTRASEÑA
     # ══════════════════════════════════════════════════════
     def _eliminar_venta_protegida(self):
-        """
-        Flujo de eliminación segura de una venta del historial.
-
-        Capas de validación (fail-fast, de menor a mayor costo):
-          1. ¿Hay venta seleccionada?         → barato, solo leer UI
-          2. ¿Se ingresó contraseña?          → diálogo modal
-          3. ¿Contraseña correcta? (hash)     → comparación en memoria
-          4. ¿Confirmar con resumen?          → doble intención
-          5. DELETE en transacción atómica    → detalle primero, luego cabecera
-          6. Manejo de excepción de BD        → rollback automático
-        """
-
-        # ── Capa 1: Validar que haya una venta seleccionada ──────────────
         sel = self.tabla_hist.selection()
         if not sel:
             messagebox.showinfo(
@@ -1165,20 +1547,14 @@ class PuntoDeVenta(tk.Tk):
                 "Primero selecciona una venta de la tabla antes de eliminar.",
                 parent=self
             )
-            return  # Salida temprana: no tiene sentido continuar
-
-        # Extraer datos de la venta para mostrarlos en los diálogos
+            return
         vals = self.tabla_hist.item(sel[0], "values")
         venta_id   = int(vals[0])
         venta_fecha = vals[1]
         venta_total = vals[2]
-
-        # ── Capa 2 y 3: Diálogo de contraseña con validación de hash ─────
         password_ok = self._pedir_y_validar_password(venta_id, venta_fecha, venta_total)
         if not password_ok:
-            return  # El método interno ya mostró el mensaje de error
-
-        # ── Capa 4: Confirmación final con resumen de la venta ────────────
+            return
         confirmado = messagebox.askyesno(
             "⚠ Confirmar eliminación",
             f"Estás a punto de eliminar PERMANENTEMENTE:\n\n"
@@ -1190,39 +1566,25 @@ class PuntoDeVenta(tk.Tk):
             parent=self
         )
         if not confirmado:
-            return  # El usuario canceló en el último momento
-
-        # ── Capa 5 y 6: Eliminar en transacción atómica ───────────────────
+            return
         try:
             with get_conn() as conn:
-                # ORDEN CRÍTICO: primero el detalle (FK hijo), luego la cabecera (FK padre)
-                # Si se invirtiera el orden, SQLite lanzaría un error de integridad referencial.
                 conn.execute(
                     "DELETE FROM detalle_venta WHERE venta_id = ?", (venta_id,)
                 )
                 conn.execute(
                     "DELETE FROM ventas WHERE id = ?", (venta_id,)
                 )
-                # El 'with' hace COMMIT automático al salir sin excepciones.
-                # Si algo falla aquí dentro, hace ROLLBACK automático,
-                # dejando la BD intacta.
-
         except sqlite3.Error as e:
-            # Error inesperado de base de datos (disco lleno, BD corrupta, etc.)
             messagebox.showerror(
                 "Error de base de datos",
                 f"No se pudo eliminar la venta.\nDetalle técnico: {e}",
                 parent=self
             )
             return
-
-        # ── Éxito: limpiar UI y recargar ──────────────────────────────────
-        # Limpiar el panel de detalle (puede mostrar datos de la venta eliminada)
         for row in self.tabla_det.get_children():
             self.tabla_det.delete(row)
-
-        self._cargar_historial()  # Refresca tabla e indicadores KPI
-
+        self._cargar_historial()
         messagebox.showinfo(
             "✔ Venta eliminada",
             f"La venta #{venta_id} fue eliminada correctamente.",
@@ -1230,55 +1592,34 @@ class PuntoDeVenta(tk.Tk):
         )
 
     def _pedir_y_validar_password(self, venta_id, fecha, total):
-        """Muestra un diálogo modal para ingresar la contraseña de administrador.
-            Permite hasta 3 intentos antes de bloquear la operación.
-            Retorna True si la contraseña es correcta, False en caso contrario.
-
-            Por qué un método separado:
-              - Responsabilidad única: solo se ocupa de autenticar
-              - Testeable de forma independiente
-              - Reutilizable si en el futuro se necesita en otras acciones protegidas"""
         MAX_INTENTOS = 3
         for intento in range(1, MAX_INTENTOS + 1):
-
-            # ── Construir el diálogo modal ────────────────────────────────
             dlg = tk.Toplevel(self)
             dlg.title("🔒 Autenticación requerida")
             dlg.configure(bg=C["card"])
             dlg.resizable(False, False)
-            dlg.grab_set()   # Modal: bloquea la ventana principal mientras está abierto
+            dlg.grab_set()
             dlg.focus_set()
-
-            # Centrar el diálogo sobre la ventana principal
             self.update_idletasks()
             x = self.winfo_x() + (self.winfo_width()  // 2) - 220
             y = self.winfo_y() + (self.winfo_height() // 2) - 120
             dlg.geometry(f"440x240+{x}+{y}")
-
-            # ── Contenido del diálogo ─────────────────────────────────────
             tk.Label(dlg, text="🔒  ELIMINAR VENTA — ACCESO RESTRINGIDO",
                      fg=C["red"], bg=C["card"],
                      font=("Courier", 10, "bold")).pack(pady=(18,4))
-
             tk.Label(dlg,
                      text=f"Venta #{venta_id}  •  {fecha}  •  {total}",
                      fg=C["muted"], bg=C["card"],
                      font=("Courier", 9)).pack()
-
             tk.Frame(dlg, bg=C["border"], height=1).pack(fill="x", padx=20, pady=10)
-
-            # Indicador de intento si ya hubo errores previos
             if intento > 1:
                 tk.Label(dlg,
                          text=f"✕ Contraseña incorrecta — intento {intento} de {MAX_INTENTOS}",
                          fg=C["yellow"], bg=C["card"],
                          font=("Courier", 9)).pack(pady=(0,4))
-
             tk.Label(dlg, text="Ingresa la contraseña de administrador:",
                      fg=C["text"], bg=C["card"],
                      font=("Courier", 10)).pack(pady=(0,6))
-
-            # Campo de contraseña (show="•" oculta los caracteres)
             sv_pass = tk.StringVar()
             entry_pass = tk.Entry(dlg, textvariable=sv_pass,
                                   show="•",
@@ -1290,22 +1631,16 @@ class PuntoDeVenta(tk.Tk):
                                   width=24)
             entry_pass.pack(ipady=7, pady=(0,12))
             entry_pass.focus()
-
-            # Variable de resultado del diálogo
-            resultado = {"accion": None}  # "ok" | "cancelar"
-
+            resultado = {"accion": None}
             def _confirmar(event=None):
                 resultado["accion"] = "ok"
                 dlg.destroy()
-
             def _cancelar(event=None):
                 resultado["accion"] = "cancelar"
                 dlg.destroy()
-
             entry_pass.bind("<Return>", _confirmar)
             entry_pass.bind("<Escape>", _cancelar)
-            dlg.protocol("WM_DELETE_WINDOW", _cancelar)  # El botón X también cancela
-
+            dlg.protocol("WM_DELETE_WINDOW", _cancelar)
             btn_frame = tk.Frame(dlg, bg=C["card"])
             btn_frame.pack()
             tk.Button(btn_frame, text="✔ Confirmar", bg=C["red"], fg=C["white"],
@@ -1314,32 +1649,18 @@ class PuntoDeVenta(tk.Tk):
             tk.Button(btn_frame, text="✕ Cancelar", bg=C["panel"], fg=C["muted"],
                       bd=0, font=("Courier", 10), padx=16, pady=6,
                       cursor="hand2", command=_cancelar).pack(side="left", padx=4)
-
-            # Esperar a que el diálogo se cierre (bloqueo local del event loop)
             dlg.wait_window()
-
-            # ── Evaluar resultado ─────────────────────────────────────────
             if resultado["accion"] == "cancelar":
-                # El usuario cerró o presionó Cancelar/Escape — salir limpiamente
                 return False
-
-            # ── Capa 3: Validar contraseña con hash SHA-256 ───────────────
-            # Nunca comparar texto plano. Hashear lo ingresado y comparar hashes.
             ingresada = sv_pass.get()
-
-            # Error de validación: campo vacío
             if not ingresada:
                 messagebox.showwarning(
                     "Campo vacío", "Debes ingresar una contraseña.", parent=self
                 )
-                continue  # Cuenta como intento
-
+                continue
             hash_ingresada = _hash(ingresada)
-
             if hash_ingresada == get_admin_hash():
-                return True  # ✔ Autenticación exitosa
-
-            # Contraseña incorrecta — si no quedan intentos, abortar
+                return True
             if intento == MAX_INTENTOS:
                 messagebox.showerror(
                     "Acceso denegado",
@@ -1348,10 +1669,7 @@ class PuntoDeVenta(tk.Tk):
                     parent=self
                 )
                 return False
-
-            # Queda al menos un intento más → el bucle abre un nuevo diálogo
-
-        return False  # Salvaguarda: nunca debería llegar aquí
+        return False
 
 
 # ──────────────────────────────────────────────────────────
