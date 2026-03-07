@@ -88,6 +88,46 @@ def init_db():
                 fecha_alta    TEXT    NOT NULL DEFAULT (datetime('now','localtime'))
             );
 
+            CREATE TABLE IF NOT EXISTS categorias_contables (
+                id         INTEGER PRIMARY KEY AUTOINCREMENT,
+                nombre     TEXT UNIQUE NOT NULL,
+                tipo       TEXT NOT NULL CHECK (tipo IN ('INGRESO','EGRESO')),
+                naturaleza TEXT NOT NULL CHECK (naturaleza IN ('FIJO','VARIABLE','NO_APLICA')),
+                activa     INTEGER NOT NULL DEFAULT 1
+            );
+
+            CREATE TABLE IF NOT EXISTS movimientos_caja (
+                id          INTEGER PRIMARY KEY AUTOINCREMENT,
+                fecha       TEXT    NOT NULL DEFAULT (datetime('now','localtime')),
+                tipo        TEXT    NOT NULL CHECK (tipo IN ('INGRESO','EGRESO')),
+                subtipo     TEXT    NOT NULL CHECK (subtipo IN ('VENTA','GASTO','RETIRO_DUENO','DEPOSITO','AJUSTE','INGRESO_EXTRA')),
+                categoria   TEXT    NOT NULL,
+                concepto    TEXT    NOT NULL,
+                metodo_pago TEXT    NOT NULL DEFAULT 'EFECTIVO',
+                monto       REAL    NOT NULL CHECK (monto >= 0),
+                referencia  TEXT    DEFAULT '',
+                venta_id    INTEGER DEFAULT NULL,
+                usuario     TEXT    DEFAULT 'admin',
+                notas       TEXT    DEFAULT '',
+                FOREIGN KEY (venta_id) REFERENCES ventas(id)
+            );
+
+            CREATE TABLE IF NOT EXISTS cortes_caja (
+                id               INTEGER PRIMARY KEY AUTOINCREMENT,
+                fecha_apertura   TEXT NOT NULL,
+                fecha_cierre     TEXT DEFAULT NULL,
+                saldo_inicial    REAL NOT NULL DEFAULT 0,
+                ventas_efectivo  REAL NOT NULL DEFAULT 0,
+                ingresos_extra   REAL NOT NULL DEFAULT 0,
+                egresos          REAL NOT NULL DEFAULT 0,
+                saldo_teorico    REAL NOT NULL DEFAULT 0,
+                saldo_real       REAL DEFAULT NULL,
+                diferencia       REAL DEFAULT NULL,
+                estado           TEXT NOT NULL DEFAULT 'ABIERTO' CHECK (estado IN ('ABIERTO','CERRADO')),
+                usuario_apertura TEXT DEFAULT 'admin',
+                usuario_cierre   TEXT DEFAULT ''
+            );
+
             CREATE TABLE IF NOT EXISTS detalle_venta (
                 id          INTEGER PRIMARY KEY AUTOINCREMENT,
                 venta_id    INTEGER NOT NULL,
@@ -118,11 +158,33 @@ def init_db():
             "ALTER TABLE clientes ADD COLUMN ultima_visita TEXT DEFAULT NULL",
             "ALTER TABLE clientes ADD COLUMN total_compras REAL NOT NULL DEFAULT 0",
             "ALTER TABLE clientes ADD COLUMN fecha_alta TEXT NOT NULL DEFAULT (datetime('now','localtime'))",
+            "ALTER TABLE movimientos_caja ADD COLUMN usuario TEXT DEFAULT 'admin'",
+            "ALTER TABLE movimientos_caja ADD COLUMN notas TEXT DEFAULT ''",
         ]:
             try:
                 conn.execute(sql)
             except Exception:
                 pass  # La columna ya existe — ignorar
+
+        cur_cat = conn.execute("SELECT COUNT(*) FROM categorias_contables")
+        if cur_cat.fetchone()[0] == 0:
+            conn.executemany(
+                "INSERT INTO categorias_contables (nombre,tipo,naturaleza,activa) VALUES (?,?,?,1)",
+                [
+                    ("Ventas", "INGRESO", "NO_APLICA"),
+                    ("Ingreso extra", "INGRESO", "NO_APLICA"),
+                    ("Depósito", "INGRESO", "NO_APLICA"),
+                    ("Ajuste de caja (+)", "INGRESO", "NO_APLICA"),
+                    ("Compra inventario", "EGRESO", "VARIABLE"),
+                    ("Renta", "EGRESO", "FIJO"),
+                    ("Sueldos", "EGRESO", "FIJO"),
+                    ("Servicios", "EGRESO", "FIJO"),
+                    ("Transporte", "EGRESO", "VARIABLE"),
+                    ("Mantenimiento", "EGRESO", "VARIABLE"),
+                    ("Retiro dueño", "EGRESO", "NO_APLICA"),
+                    ("Ajuste de caja (-)", "EGRESO", "NO_APLICA"),
+                ]
+            )
         cur = conn.execute("SELECT COUNT(*) FROM productos")
         if cur.fetchone()[0] == 0:
             conn.executemany(
@@ -416,6 +478,7 @@ class PuntoDeVenta(tk.Tk):
         self._alertas_caducidad_notificadas = set()
         self._clientes_cache = []
         self._cliente_id_por_opcion = {"Público general": None}
+        self._categorias_contables_cache = []
         self._build_ui()
         self._cargar_productos()
         self._cargar_clientes_en_venta()
@@ -437,6 +500,7 @@ class PuntoDeVenta(tk.Tk):
         for label, cmd in [("🛒  Ventas", self._show_ventas),
                            ("📦  Productos", self._show_productos),
                            ("👥  CRM", self._show_crm),
+                           ("💰  Contabilidad", self._show_contabilidad),
                            ("📊  Historial", self._show_historial)]:
             b = tk.Button(nav_frame, text=label, bg=C["panel"], fg=C["muted"],
                           bd=0, padx=16, pady=6, cursor="hand2",
@@ -455,6 +519,7 @@ class PuntoDeVenta(tk.Tk):
         self._build_page_ventas()
         self._build_page_productos()
         self._build_page_crm()
+        self._build_page_contabilidad()
         self._build_page_historial()
         self._show_ventas()
 
@@ -463,7 +528,7 @@ class PuntoDeVenta(tk.Tk):
             p.pack_forget()
         self.pages[name].pack(fill="both", expand=True)
         labels = {"ventas": "🛒  Ventas", "productos": "📦  Productos",
-                  "crm": "👥  CRM", "historial": "📊  Historial"}
+                  "crm": "👥  CRM", "contabilidad": "💰  Contabilidad", "historial": "📊  Historial"}
         for k, b in self.nav_btns.items():
             b.config(fg=C["accent"] if k == labels[name] else C["muted"],
                      bg=C["card"] if k == labels[name] else C["panel"])
@@ -479,6 +544,9 @@ class PuntoDeVenta(tk.Tk):
     def _show_crm(self):
         self._cargar_tabla_clientes()
         self._show_page("crm")
+    def _show_contabilidad(self):
+        self._cargar_contabilidad_vista()
+        self._show_page("contabilidad")
     def _show_historial(self): self._cargar_historial(); self._show_page("historial")
 
     # ══════════════════════════════════════════════════════
@@ -1014,6 +1082,13 @@ class PuntoDeVenta(tk.Tk):
                     (fecha, total, cliente_id)
                 )
 
+            self.registrar_movimiento_venta(
+                venta_id=venta_id,
+                total=total,
+                metodo_pago="EFECTIVO",
+                conn=conn
+            )
+
             conn.commit()
         except RuntimeError as e:
             if conn:
@@ -1050,6 +1125,8 @@ class PuntoDeVenta(tk.Tk):
         if hasattr(self, "tabla_clientes"):
             self._cargar_tabla_clientes()
         self._cargar_clientes_en_venta()
+        if hasattr(self, "tabla_conta"):
+            self._cargar_tabla_contabilidad()
 
     def _cliente_id_venta_actual(self):
         if not hasattr(self, "sv_cliente_venta"):
@@ -1086,6 +1163,414 @@ class PuntoDeVenta(tk.Tk):
             self.sv_cliente_venta.set(actual)
         else:
             self.sv_cliente_venta.set("Público general")
+
+    # ── Contabilidad (núcleo) ─────────────────────────────
+    def _cargar_categorias_contables_cache(self):
+        with get_conn() as conn:
+            self._categorias_contables_cache = conn.execute(
+                "SELECT nombre,tipo,naturaleza"
+                " FROM categorias_contables"
+                " WHERE activa = 1"
+                " ORDER BY tipo, nombre"
+            ).fetchall()
+
+    def _categorias_por_tipo(self, tipo):
+        return [c[0] for c in self._categorias_contables_cache if c[1] == tipo]
+
+    def _opciones_subtipo_por_tipo(self, tipo):
+        if tipo == "INGRESO":
+            return ["VENTA", "INGRESO_EXTRA", "DEPOSITO", "AJUSTE"]
+        return ["GASTO", "RETIRO_DUENO", "AJUSTE"]
+
+    def _categoria_default(self, tipo, subtipo):
+        if tipo == "INGRESO" and subtipo == "VENTA":
+            return "Ventas"
+        if tipo == "INGRESO" and subtipo == "INGRESO_EXTRA":
+            return "Ingreso extra"
+        if tipo == "INGRESO" and subtipo == "DEPOSITO":
+            return "Depósito"
+        if tipo == "INGRESO" and subtipo == "AJUSTE":
+            return "Ajuste de caja (+)"
+        if tipo == "EGRESO" and subtipo == "RETIRO_DUENO":
+            return "Retiro dueño"
+        if tipo == "EGRESO" and subtipo == "AJUSTE":
+            return "Ajuste de caja (-)"
+        if tipo == "EGRESO" and subtipo == "GASTO":
+            for cand in ("Compra inventario", "Servicios", "Transporte", "Mantenimiento", "Renta", "Sueldos"):
+                if cand in self._categorias_por_tipo("EGRESO"):
+                    return cand
+        cats = self._categorias_por_tipo(tipo)
+        return cats[0] if cats else ""
+
+    def _registrar_movimiento_caja(
+        self, tipo, subtipo, categoria, concepto, monto,
+        metodo_pago="EFECTIVO", referencia="", venta_id=None, usuario="admin", notas="", conn=None
+    ):
+        tipo = (tipo or "").strip().upper()
+        subtipo = (subtipo or "").strip().upper()
+        if tipo not in ("INGRESO", "EGRESO"):
+            raise ValueError("Tipo de movimiento inválido.")
+        if subtipo not in ("VENTA", "GASTO", "RETIRO_DUENO", "DEPOSITO", "AJUSTE", "INGRESO_EXTRA"):
+            raise ValueError("Subtipo de movimiento inválido.")
+        if not categoria or not categoria.strip():
+            raise ValueError("La categoría es obligatoria.")
+        if not concepto or not concepto.strip():
+            raise ValueError("El concepto es obligatorio.")
+        monto = float(monto)
+        if monto <= 0:
+            raise ValueError("El monto debe ser mayor a 0.")
+
+        def _validar_categoria(conn_obj):
+            cat = conn_obj.execute(
+                "SELECT tipo FROM categorias_contables WHERE nombre = ? AND activa = 1",
+                (categoria.strip(),)
+            ).fetchone()
+            if not cat:
+                raise ValueError(f'La categoría "{categoria}" no existe o está inactiva.')
+            tipo_cat = str(cat[0]).strip().upper()
+            if tipo_cat != tipo:
+                raise ValueError(
+                    f'La categoría "{categoria}" es de tipo {tipo_cat}, no {tipo}.'
+                )
+
+        sql = (
+            "INSERT INTO movimientos_caja"
+            " (fecha,tipo,subtipo,categoria,concepto,metodo_pago,monto,referencia,venta_id,usuario,notas)"
+            " VALUES (datetime('now','localtime'),?,?,?,?,?,?,?,?,?,?)"
+        )
+        vals = (
+            tipo, subtipo, categoria.strip(), concepto.strip(), (metodo_pago or "EFECTIVO").strip().upper(),
+            monto, (referencia or "").strip(), venta_id, (usuario or "admin").strip(), (notas or "").strip()
+        )
+
+        if conn is not None:
+            _validar_categoria(conn)
+            cur = conn.execute(sql, vals)
+            return cur.lastrowid
+        with get_conn() as own:
+            _validar_categoria(own)
+            cur = own.execute(sql, vals)
+            return cur.lastrowid
+
+    def registrar_movimiento_venta(self, venta_id, total, metodo_pago="EFECTIVO", conn=None):
+        if float(total) <= 0:
+            return None
+        return self._registrar_movimiento_caja(
+            tipo="INGRESO",
+            subtipo="VENTA",
+            categoria="Ventas",
+            concepto=f"Venta #{venta_id}",
+            monto=total,
+            metodo_pago=metodo_pago,
+            referencia=str(venta_id),
+            venta_id=venta_id,
+            conn=conn
+        )
+
+    def sincronizar_venta_en_caja(self, venta_id):
+        with get_conn() as conn:
+            venta = conn.execute(
+                "SELECT id,total FROM ventas WHERE id = ?",
+                (venta_id,)
+            ).fetchone()
+            conn.execute("DELETE FROM movimientos_caja WHERE venta_id = ?", (venta_id,))
+            if venta:
+                self.registrar_movimiento_venta(venta[0], venta[1], conn=conn)
+
+    def registrar_gasto(self, categoria, concepto, monto, naturaleza=None, referencia=""):
+        return self._registrar_movimiento_caja(
+            tipo="EGRESO",
+            subtipo="GASTO",
+            categoria=categoria,
+            concepto=concepto,
+            monto=monto,
+            metodo_pago="EFECTIVO",
+            referencia=referencia
+        )
+
+    def registrar_retiro_dueno(self, monto, concepto="Retiro de dueño"):
+        return self._registrar_movimiento_caja(
+            tipo="EGRESO",
+            subtipo="RETIRO_DUENO",
+            categoria="Retiro dueño",
+            concepto=concepto,
+            monto=monto,
+            metodo_pago="EFECTIVO"
+        )
+
+    def registrar_ingreso_extra(self, categoria, concepto, monto):
+        return self._registrar_movimiento_caja(
+            tipo="INGRESO",
+            subtipo="INGRESO_EXTRA",
+            categoria=categoria,
+            concepto=concepto,
+            monto=monto,
+            metodo_pago="EFECTIVO"
+        )
+
+    def abrir_caja(self, saldo_inicial, usuario="admin"):
+        saldo_inicial = float(saldo_inicial)
+        if saldo_inicial < 0:
+            raise ValueError("El saldo inicial no puede ser negativo.")
+        with get_conn() as conn:
+            abierta = conn.execute(
+                "SELECT id FROM cortes_caja WHERE estado='ABIERTO' ORDER BY id DESC LIMIT 1"
+            ).fetchone()
+            if abierta:
+                raise RuntimeError("Ya existe una caja abierta.")
+            cur = conn.execute(
+                "INSERT INTO cortes_caja (fecha_apertura,saldo_inicial,usuario_apertura)"
+                " VALUES (datetime('now','localtime'),?,?)",
+                (saldo_inicial, usuario)
+            )
+            return cur.lastrowid
+
+    def resumen_caja_actual(self):
+        with get_conn() as conn:
+            corte = conn.execute(
+                "SELECT id,fecha_apertura,saldo_inicial FROM cortes_caja"
+                " WHERE estado='ABIERTO' ORDER BY id DESC LIMIT 1"
+            ).fetchone()
+            if not corte:
+                return None
+            corte_id, fecha_ap, saldo_inicial = corte
+            suma = conn.execute(
+                "SELECT"
+                " IFNULL(SUM(CASE WHEN tipo='INGRESO' AND subtipo='VENTA' AND metodo_pago='EFECTIVO' THEN monto END),0),"
+                " IFNULL(SUM(CASE WHEN tipo='INGRESO' AND subtipo<>'VENTA' THEN monto END),0),"
+                " IFNULL(SUM(CASE WHEN tipo='EGRESO' THEN monto END),0)"
+                " FROM movimientos_caja"
+                " WHERE fecha >= ?",
+                (fecha_ap,)
+            ).fetchone()
+            ventas_efectivo, ingresos_extra, egresos = [float(x or 0) for x in suma]
+            saldo_teorico = float(saldo_inicial) + ventas_efectivo + ingresos_extra - egresos
+            conn.execute(
+                "UPDATE cortes_caja"
+                " SET ventas_efectivo=?, ingresos_extra=?, egresos=?, saldo_teorico=?"
+                " WHERE id=?",
+                (ventas_efectivo, ingresos_extra, egresos, saldo_teorico, corte_id)
+            )
+            return {
+                "id": corte_id,
+                "fecha_apertura": fecha_ap,
+                "saldo_inicial": float(saldo_inicial),
+                "ventas_efectivo": ventas_efectivo,
+                "ingresos_extra": ingresos_extra,
+                "egresos": egresos,
+                "saldo_teorico": saldo_teorico,
+            }
+
+    def cerrar_caja(self, saldo_real, usuario="admin"):
+        saldo_real = float(saldo_real)
+        resumen = self.resumen_caja_actual()
+        if not resumen:
+            raise RuntimeError("No hay caja abierta para cerrar.")
+        diferencia = saldo_real - resumen["saldo_teorico"]
+        with get_conn() as conn:
+            conn.execute(
+                "UPDATE cortes_caja"
+                " SET fecha_cierre=datetime('now','localtime'),"
+                " saldo_real=?, diferencia=?, estado='CERRADO', usuario_cierre=?"
+                " WHERE id=?",
+                (saldo_real, diferencia, usuario, resumen["id"])
+            )
+        return diferencia
+
+    def exportar_libro_diario_csv(self, fecha_ini, fecha_fin, ruta):
+        inicio = f"{fecha_ini} 00:00:00"
+        fin = f"{fecha_fin} 23:59:59"
+        with get_conn() as conn:
+            rows = conn.execute(
+                "SELECT m.fecha, m.id, m.tipo, m.subtipo, m.categoria,"
+                " IFNULL(c.naturaleza,'NO_APLICA') AS naturaleza,"
+                " m.concepto, m.metodo_pago, m.monto, m.venta_id, m.referencia, m.usuario"
+                " FROM movimientos_caja m"
+                " LEFT JOIN categorias_contables c ON c.nombre = m.categoria"
+                " WHERE m.fecha >= ? AND m.fecha <= ?"
+                " ORDER BY m.id ASC",
+                (inicio, fin)
+            ).fetchall()
+        with open(ruta, mode="w", newline="", encoding="utf-8") as f:
+            w = csv.writer(f)
+            w.writerow([
+                "fecha", "folio", "tipo", "subtipo", "categoria", "naturaleza",
+                "concepto", "metodo_pago", "monto", "venta_id", "referencia", "usuario"
+            ])
+            for r in rows:
+                rr = list(r)
+                rr[8] = f"{float(rr[8]):.2f}"  # monto
+                w.writerow(rr)
+        return len(rows)
+
+    def reporte_resultado(self, fecha_ini, fecha_fin):
+        inicio = f"{fecha_ini} 00:00:00"
+        fin = f"{fecha_fin} 23:59:59"
+        with get_conn() as conn:
+            ingresos, egresos = conn.execute(
+                "SELECT"
+                " IFNULL(SUM(CASE WHEN tipo='INGRESO' THEN monto END),0),"
+                " IFNULL(SUM(CASE WHEN tipo='EGRESO' THEN monto END),0)"
+                " FROM movimientos_caja"
+                " WHERE fecha >= ? AND fecha <= ?",
+                (inicio, fin)
+            ).fetchone()
+            gastos_operativos = conn.execute(
+                "SELECT IFNULL(SUM(monto),0)"
+                " FROM movimientos_caja"
+                " WHERE tipo='EGRESO' AND subtipo='GASTO'"
+                " AND fecha >= ? AND fecha <= ?",
+                (inicio, fin)
+            ).fetchone()[0]
+
+        ingresos = float(ingresos or 0)
+        egresos = float(egresos or 0)
+        gastos_operativos = float(gastos_operativos or 0)
+        utilidad_operativa = ingresos - gastos_operativos
+        utilidad_neta_estimada = ingresos - egresos
+        margen_operativo = (utilidad_operativa / ingresos) if ingresos > 0 else 0
+        return {
+            "ingresos": ingresos,
+            "egresos": egresos,
+            "gastos_operativos": gastos_operativos,
+            "utilidad_operativa": utilidad_operativa,
+            "utilidad_neta_estimada": utilidad_neta_estimada,
+            "margen_operativo": margen_operativo,
+        }
+
+    def reporte_gastos_por_categoria(self, fecha_ini, fecha_fin):
+        inicio = f"{fecha_ini} 00:00:00"
+        fin = f"{fecha_fin} 23:59:59"
+        with get_conn() as conn:
+            ventas = conn.execute(
+                "SELECT IFNULL(SUM(monto),0)"
+                " FROM movimientos_caja"
+                " WHERE tipo='INGRESO' AND subtipo='VENTA'"
+                " AND fecha >= ? AND fecha <= ?",
+                (inicio, fin)
+            ).fetchone()[0]
+            rows = conn.execute(
+                "SELECT categoria, IFNULL(SUM(monto),0) AS total"
+                " FROM movimientos_caja"
+                " WHERE tipo='EGRESO' AND subtipo='GASTO'"
+                " AND fecha >= ? AND fecha <= ?"
+                " GROUP BY categoria"
+                " ORDER BY total DESC",
+                (inicio, fin)
+            ).fetchall()
+        ventas = float(ventas or 0)
+        out = []
+        for categoria, total in rows:
+            total = float(total or 0)
+            pct = (total / ventas * 100) if ventas > 0 else 0
+            out.append({"categoria": categoria, "total": total, "porcentaje_sobre_ventas": pct})
+        return out
+
+    def reporte_fijos_vs_variables(self, mes):
+        # mes esperado: 'YYYY-MM'
+        inicio = f"{mes}-01 00:00:00"
+        y, m = [int(x) for x in mes.split("-")]
+        if m == 12:
+            next_month = datetime.date(y + 1, 1, 1)
+        else:
+            next_month = datetime.date(y, m + 1, 1)
+        fin_date = next_month - datetime.timedelta(days=1)
+        fin = f"{fin_date.isoformat()} 23:59:59"
+        with get_conn() as conn:
+            fijo, variable = conn.execute(
+                "SELECT"
+                " IFNULL(SUM(CASE WHEN c.naturaleza='FIJO' THEN m.monto END),0),"
+                " IFNULL(SUM(CASE WHEN c.naturaleza='VARIABLE' THEN m.monto END),0)"
+                " FROM movimientos_caja m"
+                " LEFT JOIN categorias_contables c ON c.nombre = m.categoria"
+                " WHERE m.tipo='EGRESO' AND m.subtipo='GASTO'"
+                " AND m.fecha >= ? AND m.fecha <= ?",
+                (inicio, fin)
+            ).fetchone()
+        fijo = float(fijo or 0)
+        variable = float(variable or 0)
+        return {"fijo": fijo, "variable": variable, "total": fijo + variable}
+
+    def flujo_efectivo_diario(self, fecha_ini, fecha_fin):
+        inicio = f"{fecha_ini} 00:00:00"
+        fin = f"{fecha_fin} 23:59:59"
+        with get_conn() as conn:
+            rows = conn.execute(
+                "SELECT date(fecha) AS dia,"
+                " IFNULL(SUM(CASE WHEN tipo='INGRESO' THEN monto END),0) AS ingresos,"
+                " IFNULL(SUM(CASE WHEN tipo='EGRESO' THEN monto END),0) AS egresos"
+                " FROM movimientos_caja"
+                " WHERE fecha >= ? AND fecha <= ?"
+                " GROUP BY date(fecha)"
+                " ORDER BY dia ASC",
+                (inicio, fin)
+            ).fetchall()
+        return [
+            {
+                "fecha": r[0],
+                "ingresos": float(r[1] or 0),
+                "egresos": float(r[2] or 0),
+                "flujo_neto": float(r[1] or 0) - float(r[2] or 0),
+            }
+            for r in rows
+        ]
+
+    def exportar_resumen_mensual_csv(self, anio, mes, ruta):
+        mes_txt = f"{int(anio):04d}-{int(mes):02d}"
+        inicio = f"{mes_txt}-01 00:00:00"
+        y, m = int(anio), int(mes)
+        if m == 12:
+            next_month = datetime.date(y + 1, 1, 1)
+        else:
+            next_month = datetime.date(y, m + 1, 1)
+        fin_date = next_month - datetime.timedelta(days=1)
+        fin = f"{fin_date.isoformat()} 23:59:59"
+
+        with get_conn() as conn:
+            rows = conn.execute(
+                "SELECT m.tipo, m.categoria, IFNULL(c.naturaleza,'NO_APLICA') AS naturaleza,"
+                " IFNULL(SUM(m.monto),0) AS total"
+                " FROM movimientos_caja m"
+                " LEFT JOIN categorias_contables c ON c.nombre = m.categoria"
+                " WHERE m.fecha >= ? AND m.fecha <= ?"
+                " GROUP BY m.tipo, m.categoria, naturaleza"
+                " ORDER BY m.tipo, total DESC",
+                (inicio, fin)
+            ).fetchall()
+
+        with open(ruta, mode="w", newline="", encoding="utf-8") as f:
+            w = csv.writer(f)
+            w.writerow(["tipo", "categoria", "naturaleza", "total"])
+            for tipo, categoria, naturaleza, total in rows:
+                w.writerow([tipo, categoria, naturaleza, f"{float(total):.2f}"])
+        return len(rows)
+
+    def exportar_cortes_caja_csv(self, fecha_ini, fecha_fin, ruta):
+        inicio = f"{fecha_ini} 00:00:00"
+        fin = f"{fecha_fin} 23:59:59"
+        with get_conn() as conn:
+            rows = conn.execute(
+                "SELECT id,fecha_apertura,fecha_cierre,saldo_inicial,ventas_efectivo,ingresos_extra,"
+                " egresos,saldo_teorico,saldo_real,diferencia,estado,usuario_apertura,usuario_cierre"
+                " FROM cortes_caja"
+                " WHERE fecha_apertura >= ? AND fecha_apertura <= ?"
+                " ORDER BY id DESC",
+                (inicio, fin)
+            ).fetchall()
+        with open(ruta, mode="w", newline="", encoding="utf-8") as f:
+            w = csv.writer(f)
+            w.writerow([
+                "id", "fecha_apertura", "fecha_cierre", "saldo_inicial", "ventas_efectivo",
+                "ingresos_extra", "egresos", "saldo_teorico", "saldo_real", "diferencia",
+                "estado", "usuario_apertura", "usuario_cierre"
+            ])
+            for r in rows:
+                rr = list(r)
+                for idx in (3, 4, 5, 6, 7, 8, 9):
+                    if rr[idx] is not None:
+                        rr[idx] = f"{float(rr[idx]):.2f}"
+                w.writerow(rr)
+        return len(rows)
 
     def _set_caducidad_form(self, valor):
         fecha = (valor or "").strip()
@@ -1768,6 +2253,609 @@ class PuntoDeVenta(tk.Tk):
         self._cargar_clientes_en_venta()
 
     # ══════════════════════════════════════════════════════
+    #  PÁGINA: CONTABILIDAD
+    # ══════════════════════════════════════════════════════
+    def _build_page_contabilidad(self):
+        page = tk.Frame(self.content, bg=C["bg"])
+        self.pages["contabilidad"] = page
+
+        form = tk.Frame(page, bg=C["card"], padx=12, pady=10)
+        form.pack(fill="x", pady=(0, 10))
+        tk.Label(form, text="MOVIMIENTOS CONTABLES (INGRESOS / EGRESOS)",
+                 fg=C["muted"], bg=C["card"], font=("Courier", 9, "bold")).grid(
+                     row=0, column=0, columnspan=8, sticky="w", pady=(0, 8))
+
+        self.sv_conta_tipo = tk.StringVar(value="EGRESO")
+        self.sv_conta_subtipo = tk.StringVar(value="GASTO")
+        self.sv_conta_categoria = tk.StringVar(value="")
+        self.sv_conta_metodo = tk.StringVar(value="EFECTIVO")
+        self.sv_conta_concepto = tk.StringVar(value="")
+        self.sv_conta_monto = tk.StringVar(value="")
+        self.sv_conta_ref = tk.StringVar(value="")
+
+        tk.Label(form, text="Tipo", fg=C["muted"], bg=C["card"], font=("Courier", 9)).grid(
+            row=1, column=0, sticky="w", padx=(0, 4))
+        self.cmb_conta_tipo = ttk.Combobox(
+            form, textvariable=self.sv_conta_tipo, state="readonly", values=("INGRESO", "EGRESO"), width=10
+        )
+        self.cmb_conta_tipo.grid(row=2, column=0, sticky="ew", padx=(0, 8), ipady=3)
+        self.cmb_conta_tipo.bind("<<ComboboxSelected>>", self._on_conta_tipo_change)
+
+        tk.Label(form, text="Subtipo", fg=C["muted"], bg=C["card"], font=("Courier", 9)).grid(
+            row=1, column=1, sticky="w", padx=(0, 4))
+        self.cmb_conta_subtipo = ttk.Combobox(
+            form, textvariable=self.sv_conta_subtipo, state="readonly", width=14
+        )
+        self.cmb_conta_subtipo.grid(row=2, column=1, sticky="ew", padx=(0, 8), ipady=3)
+        self.cmb_conta_subtipo.bind("<<ComboboxSelected>>", self._on_conta_subtipo_change)
+
+        tk.Label(form, text="Categoría", fg=C["muted"], bg=C["card"], font=("Courier", 9)).grid(
+            row=1, column=2, sticky="w", padx=(0, 4))
+        self.cmb_conta_categoria = ttk.Combobox(
+            form, textvariable=self.sv_conta_categoria, state="readonly", width=20
+        )
+        self.cmb_conta_categoria.grid(row=2, column=2, sticky="ew", padx=(0, 8), ipady=3)
+
+        tk.Label(form, text="Concepto", fg=C["muted"], bg=C["card"], font=("Courier", 9)).grid(
+            row=1, column=3, sticky="w", padx=(0, 4))
+        tk.Entry(form, textvariable=self.sv_conta_concepto, bg=C["panel"], fg=C["text"],
+                 insertbackground=C["text"], bd=0, font=("Courier", 11),
+                 highlightthickness=1, highlightbackground=C["border"]).grid(
+                     row=2, column=3, sticky="ew", padx=(0, 8), ipady=6)
+
+        tk.Label(form, text="Monto", fg=C["muted"], bg=C["card"], font=("Courier", 9)).grid(
+            row=1, column=4, sticky="w", padx=(0, 4))
+        tk.Entry(form, textvariable=self.sv_conta_monto, bg=C["panel"], fg=C["text"],
+                 insertbackground=C["text"], bd=0, font=("Courier", 11),
+                 highlightthickness=1, highlightbackground=C["border"], width=12).grid(
+                     row=2, column=4, sticky="ew", padx=(0, 8), ipady=6)
+
+        tk.Label(form, text="Método", fg=C["muted"], bg=C["card"], font=("Courier", 9)).grid(
+            row=1, column=5, sticky="w", padx=(0, 4))
+        self.cmb_conta_metodo = ttk.Combobox(
+            form, textvariable=self.sv_conta_metodo, state="readonly",
+            values=("EFECTIVO", "TRANSFERENCIA", "TARJETA", "OTRO"), width=14
+        )
+        self.cmb_conta_metodo.grid(row=2, column=5, sticky="ew", padx=(0, 8), ipady=3)
+
+        tk.Label(form, text="Referencia", fg=C["muted"], bg=C["card"], font=("Courier", 9)).grid(
+            row=1, column=6, sticky="w", padx=(0, 4))
+        tk.Entry(form, textvariable=self.sv_conta_ref, bg=C["panel"], fg=C["text"],
+                 insertbackground=C["text"], bd=0, font=("Courier", 11),
+                 highlightthickness=1, highlightbackground=C["border"], width=14).grid(
+                     row=2, column=6, sticky="ew", padx=(0, 8), ipady=6)
+
+        btns = tk.Frame(form, bg=C["card"])
+        btns.grid(row=2, column=7, sticky="e")
+        tk.Button(btns, text="＋ Registrar", bg=C["accent"], fg=C["white"], bd=0,
+                  font=("Courier", 10, "bold"), padx=10, pady=6, cursor="hand2",
+                  command=self._registrar_movimiento_desde_form).pack(side="left", padx=(0, 4))
+        tk.Button(btns, text="⟳ Limpiar", bg=C["panel"], fg=C["muted"], bd=0,
+                  font=("Courier", 10), padx=10, pady=6, cursor="hand2",
+                  command=self._limpiar_form_contabilidad).pack(side="left")
+
+        form.columnconfigure(0, weight=1, minsize=90)
+        form.columnconfigure(1, weight=1, minsize=110)
+        form.columnconfigure(2, weight=2, minsize=140)
+        form.columnconfigure(3, weight=4, minsize=240)
+        form.columnconfigure(4, weight=1, minsize=100)
+        form.columnconfigure(5, weight=1, minsize=120)
+        form.columnconfigure(6, weight=1, minsize=120)
+
+        filt = tk.Frame(page, bg=C["card"], padx=12, pady=10)
+        filt.pack(fill="x", pady=(0, 10))
+        tk.Label(filt, text="Desde (YYYY-MM-DD):", fg=C["muted"], bg=C["card"],
+                 font=("Courier", 9)).pack(side="left")
+        hoy = datetime.date.today().isoformat()
+        self.sv_conta_ini = tk.StringVar(value=hoy)
+        self.sv_conta_fin = tk.StringVar(value=hoy)
+        tk.Entry(filt, textvariable=self.sv_conta_ini, bg=C["panel"], fg=C["text"],
+                 insertbackground=C["text"], bd=0, font=("Courier", 10),
+                 highlightthickness=1, highlightbackground=C["border"], width=12).pack(
+                     side="left", padx=(6, 10), ipady=5)
+        tk.Label(filt, text="Hasta:", fg=C["muted"], bg=C["card"],
+                 font=("Courier", 9)).pack(side="left")
+        tk.Entry(filt, textvariable=self.sv_conta_fin, bg=C["panel"], fg=C["text"],
+                 insertbackground=C["text"], bd=0, font=("Courier", 10),
+                 highlightthickness=1, highlightbackground=C["border"], width=12).pack(
+                     side="left", padx=(6, 10), ipady=5)
+        tk.Button(filt, text="Hoy", bg=C["panel"], fg=C["muted"], bd=0,
+                  font=("Courier", 10), padx=10, pady=5, cursor="hand2",
+                  command=self._conta_set_hoy).pack(side="left")
+        tk.Button(filt, text="Actualizar", bg=C["accent2"], fg=C["white"], bd=0,
+                  font=("Courier", 10), padx=10, pady=5, cursor="hand2",
+                  command=self._cargar_tabla_contabilidad).pack(side="right", padx=(8, 0))
+        tk.Button(filt, text="💾 Cortes CSV", bg=C["accent2"], fg=C["white"], bd=0,
+                  font=("Courier", 10), padx=10, pady=5, cursor="hand2",
+                  command=self._exportar_cortes_caja_csv_ui).pack(side="right", padx=(8, 0))
+        tk.Button(filt, text="💾 Resumen mensual CSV", bg=C["accent2"], fg=C["white"], bd=0,
+                  font=("Courier", 10), padx=10, pady=5, cursor="hand2",
+                  command=self._exportar_resumen_mensual_csv_ui).pack(side="right", padx=(8, 0))
+        tk.Button(filt, text="💾 Libro Diario CSV", bg=C["accent"], fg=C["white"], bd=0,
+                  font=("Courier", 10, "bold"), padx=10, pady=5, cursor="hand2",
+                  command=self._exportar_libro_diario_csv_ui).pack(side="right")
+
+        caja = tk.Frame(page, bg=C["card"], padx=12, pady=10)
+        caja.pack(fill="x", pady=(0, 10))
+        tk.Label(caja, text="APERTURA / CIERRE DE CAJA",
+                 fg=C["muted"], bg=C["card"], font=("Courier", 9, "bold")).grid(
+                     row=0, column=0, columnspan=8, sticky="w", pady=(0, 8))
+
+        self.sv_caja_estado = tk.StringVar(value="CERRADO")
+        self.sv_caja_id = tk.StringVar(value="-")
+        self.sv_caja_apertura = tk.StringVar(value="-")
+        self.sv_caja_ventas = tk.StringVar(value="$0.00")
+        self.sv_caja_ingresos_extra = tk.StringVar(value="$0.00")
+        self.sv_caja_egresos = tk.StringVar(value="$0.00")
+        self.sv_caja_saldo_teorico = tk.StringVar(value="$0.00")
+        self.sv_caja_saldo_inicial = tk.StringVar(value="0.00")
+        self.sv_caja_saldo_real = tk.StringVar(value="")
+        self.sv_caja_diferencia = tk.StringVar(value="$0.00")
+        self._caja_abierta_id = None
+        self._caja_saldo_teorico_actual = 0.0
+        self.sv_caja_saldo_real.trace_add("write", lambda *a: self._conta_recalcular_diferencia_preview())
+
+        tk.Label(caja, text="Estado", fg=C["muted"], bg=C["card"], font=("Courier", 9)).grid(
+            row=1, column=0, sticky="w", padx=(0, 4))
+        self.lbl_caja_estado = tk.Label(
+            caja, textvariable=self.sv_caja_estado, fg=C["red"], bg=C["card"], font=("Courier", 11, "bold")
+        )
+        self.lbl_caja_estado.grid(row=2, column=0, sticky="w", padx=(0, 10))
+
+        tk.Label(caja, text="Folio", fg=C["muted"], bg=C["card"], font=("Courier", 9)).grid(
+            row=1, column=1, sticky="w", padx=(0, 4))
+        tk.Label(caja, textvariable=self.sv_caja_id, fg=C["text"], bg=C["card"], font=("Courier", 11)).grid(
+            row=2, column=1, sticky="w", padx=(0, 10))
+
+        tk.Label(caja, text="Apertura", fg=C["muted"], bg=C["card"], font=("Courier", 9)).grid(
+            row=1, column=2, sticky="w", padx=(0, 4))
+        tk.Label(caja, textvariable=self.sv_caja_apertura, fg=C["text"], bg=C["card"], font=("Courier", 10)).grid(
+            row=2, column=2, sticky="w", padx=(0, 10))
+
+        tk.Label(caja, text="Ventas efectivo", fg=C["muted"], bg=C["card"], font=("Courier", 9)).grid(
+            row=1, column=3, sticky="w", padx=(0, 4))
+        tk.Label(caja, textvariable=self.sv_caja_ventas, fg=C["green"], bg=C["card"], font=("Courier", 11, "bold")).grid(
+            row=2, column=3, sticky="w", padx=(0, 10))
+
+        tk.Label(caja, text="Ingresos extra", fg=C["muted"], bg=C["card"], font=("Courier", 9)).grid(
+            row=1, column=4, sticky="w", padx=(0, 4))
+        tk.Label(caja, textvariable=self.sv_caja_ingresos_extra, fg=C["green"], bg=C["card"], font=("Courier", 11, "bold")).grid(
+            row=2, column=4, sticky="w", padx=(0, 10))
+
+        tk.Label(caja, text="Egresos", fg=C["muted"], bg=C["card"], font=("Courier", 9)).grid(
+            row=1, column=5, sticky="w", padx=(0, 4))
+        tk.Label(caja, textvariable=self.sv_caja_egresos, fg=C["red"], bg=C["card"], font=("Courier", 11, "bold")).grid(
+            row=2, column=5, sticky="w", padx=(0, 10))
+
+        tk.Label(caja, text="Saldo teórico", fg=C["muted"], bg=C["card"], font=("Courier", 9)).grid(
+            row=1, column=6, sticky="w", padx=(0, 4))
+        tk.Label(caja, textvariable=self.sv_caja_saldo_teorico, fg=C["accent"], bg=C["card"], font=("Courier", 11, "bold")).grid(
+            row=2, column=6, sticky="w", padx=(0, 10))
+
+        tk.Label(caja, text="Saldo inicial", fg=C["muted"], bg=C["card"], font=("Courier", 9)).grid(
+            row=3, column=0, sticky="w", padx=(0, 4), pady=(8, 0))
+        tk.Entry(caja, textvariable=self.sv_caja_saldo_inicial, bg=C["panel"], fg=C["text"],
+                 insertbackground=C["text"], bd=0, font=("Courier", 11),
+                 highlightthickness=1, highlightbackground=C["border"], width=12).grid(
+                     row=4, column=0, sticky="ew", padx=(0, 8), ipady=6)
+
+        tk.Label(caja, text="Saldo real (cierre)", fg=C["muted"], bg=C["card"], font=("Courier", 9)).grid(
+            row=3, column=1, sticky="w", padx=(0, 4), pady=(8, 0))
+        tk.Entry(caja, textvariable=self.sv_caja_saldo_real, bg=C["panel"], fg=C["text"],
+                 insertbackground=C["text"], bd=0, font=("Courier", 11),
+                 highlightthickness=1, highlightbackground=C["border"], width=12).grid(
+                     row=4, column=1, sticky="ew", padx=(0, 8), ipady=6)
+
+        tk.Label(caja, text="Diferencia", fg=C["muted"], bg=C["card"], font=("Courier", 9)).grid(
+            row=3, column=2, sticky="w", padx=(0, 4), pady=(8, 0))
+        tk.Entry(caja, textvariable=self.sv_caja_diferencia, state="readonly", readonlybackground=C["panel"],
+                 fg=C["text"], bd=0, font=("Courier", 11), width=14).grid(
+                     row=4, column=2, sticky="ew", padx=(0, 8), ipady=6)
+
+        btns_caja = tk.Frame(caja, bg=C["card"])
+        btns_caja.grid(row=4, column=3, columnspan=5, sticky="e")
+        self.btn_caja_abrir = tk.Button(
+            btns_caja, text="Abrir caja", bg=C["accent"], fg=C["white"], bd=0,
+            font=("Courier", 10, "bold"), padx=10, pady=6, cursor="hand2",
+            command=self._conta_abrir_caja_ui
+        )
+        self.btn_caja_abrir.pack(side="left", padx=(0, 6))
+        tk.Button(btns_caja, text="Actualizar resumen", bg=C["panel"], fg=C["muted"], bd=0,
+                  font=("Courier", 10), padx=10, pady=6, cursor="hand2",
+                  command=self._conta_refrescar_resumen_caja_ui).pack(side="left", padx=(0, 6))
+        self.btn_caja_cerrar = tk.Button(
+            btns_caja, text="Cerrar caja", bg=C["red"], fg=C["white"], bd=0,
+            font=("Courier", 10, "bold"), padx=10, pady=6, cursor="hand2",
+            command=self._conta_cerrar_caja_ui
+        )
+        self.btn_caja_cerrar.pack(side="left")
+
+        for idx in range(8):
+            caja.columnconfigure(idx, weight=1)
+        caja.columnconfigure(2, weight=2)
+        caja.columnconfigure(7, weight=1)
+
+        kpi = tk.Frame(page, bg=C["bg"])
+        kpi.pack(fill="x", pady=(0, 8))
+        self.kpi_ingresos = self._kpi_box(kpi, "INGRESOS", "$0.00", C["green"])
+        self.kpi_egresos = self._kpi_box(kpi, "EGRESOS", "$0.00", C["red"])
+        self.kpi_flujo = self._kpi_box(kpi, "FLUJO NETO", "$0.00", C["accent2"])
+
+        frame_t = tk.Frame(page, bg=C["bg"])
+        frame_t.pack(fill="both", expand=True)
+        cols = ("id", "fecha", "tipo", "subtipo", "categoria", "concepto", "metodo", "monto", "venta", "ref")
+        heads = ("Folio", "Fecha", "Tipo", "Subtipo", "Categoría", "Concepto", "Método", "Monto", "Venta", "Referencia")
+        widths = [55, 145, 85, 115, 140, 230, 105, 95, 65, 120]
+        self.tabla_conta = ttk.Treeview(frame_t, columns=cols, show="headings",
+                                        style="POS.Treeview", selectmode="browse")
+        for c, h, w in zip(cols, heads, widths):
+            self.tabla_conta.heading(c, text=h, anchor="center")
+            self.tabla_conta.column(c, width=w, anchor="center", stretch=True)
+        sb = ttk.Scrollbar(frame_t, orient="vertical", command=self.tabla_conta.yview)
+        self.tabla_conta.configure(yscrollcommand=sb.set)
+        self.tabla_conta.pack(side="left", fill="both", expand=True)
+        sb.pack(side="right", fill="y")
+        self.tabla_conta.tag_configure("ing", foreground=C["green"])
+        self.tabla_conta.tag_configure("egr", foreground=C["red"])
+
+        self._cargar_contabilidad_vista()
+
+    def _conta_set_hoy(self):
+        hoy = datetime.date.today().isoformat()
+        if hasattr(self, "sv_conta_ini"):
+            self.sv_conta_ini.set(hoy)
+        if hasattr(self, "sv_conta_fin"):
+            self.sv_conta_fin.set(hoy)
+        self._cargar_tabla_contabilidad()
+
+    def _conta_recalcular_diferencia_preview(self):
+        if not hasattr(self, "sv_caja_diferencia"):
+            return
+        txt_real = self.sv_caja_saldo_real.get().strip()
+        if not txt_real:
+            self.sv_caja_diferencia.set("$0.00")
+            return
+        try:
+            saldo_real = float(txt_real.replace(",", "."))
+        except ValueError:
+            self.sv_caja_diferencia.set("Inválido")
+            return
+        diferencia = saldo_real - float(getattr(self, "_caja_saldo_teorico_actual", 0.0) or 0.0)
+        self.sv_caja_diferencia.set(f"${diferencia:.2f}")
+
+    def _conta_refrescar_resumen_caja_ui(self):
+        if not hasattr(self, "sv_caja_estado"):
+            return
+
+        resumen = self.resumen_caja_actual()
+        if resumen:
+            self._caja_abierta_id = resumen["id"]
+            self.sv_caja_estado.set("ABIERTO")
+            if hasattr(self, "lbl_caja_estado"):
+                self.lbl_caja_estado.config(fg=C["green"])
+            self.sv_caja_id.set(f"#{resumen['id']}")
+            self.sv_caja_apertura.set(resumen["fecha_apertura"])
+            self.sv_caja_ventas.set(f"${float(resumen['ventas_efectivo']):.2f}")
+            self.sv_caja_ingresos_extra.set(f"${float(resumen['ingresos_extra']):.2f}")
+            self.sv_caja_egresos.set(f"${float(resumen['egresos']):.2f}")
+            self.sv_caja_saldo_teorico.set(f"${float(resumen['saldo_teorico']):.2f}")
+            self._caja_saldo_teorico_actual = float(resumen["saldo_teorico"])
+            if hasattr(self, "btn_caja_abrir"):
+                self.btn_caja_abrir.config(state="disabled")
+            if hasattr(self, "btn_caja_cerrar"):
+                self.btn_caja_cerrar.config(state="normal")
+            self._conta_recalcular_diferencia_preview()
+            return
+
+        with get_conn() as conn:
+            ultimo = conn.execute(
+                "SELECT id,fecha_apertura,saldo_inicial,ventas_efectivo,ingresos_extra,"
+                " egresos,saldo_teorico,saldo_real,diferencia,estado"
+                " FROM cortes_caja ORDER BY id DESC LIMIT 1"
+            ).fetchone()
+
+        self._caja_abierta_id = None
+        if hasattr(self, "btn_caja_abrir"):
+            self.btn_caja_abrir.config(state="normal")
+        if hasattr(self, "btn_caja_cerrar"):
+            self.btn_caja_cerrar.config(state="disabled")
+        if hasattr(self, "lbl_caja_estado"):
+            self.lbl_caja_estado.config(fg=C["red"])
+
+        if not ultimo:
+            self.sv_caja_estado.set("CERRADO")
+            self.sv_caja_id.set("-")
+            self.sv_caja_apertura.set("-")
+            self.sv_caja_ventas.set("$0.00")
+            self.sv_caja_ingresos_extra.set("$0.00")
+            self.sv_caja_egresos.set("$0.00")
+            self.sv_caja_saldo_teorico.set("$0.00")
+            self.sv_caja_diferencia.set("$0.00")
+            self._caja_saldo_teorico_actual = 0.0
+            return
+
+        self.sv_caja_estado.set(str(ultimo[9] or "CERRADO"))
+        self.sv_caja_id.set(f"#{ultimo[0]}")
+        self.sv_caja_apertura.set(ultimo[1] or "-")
+        self.sv_caja_saldo_inicial.set(f"{float(ultimo[2] or 0):.2f}")
+        self.sv_caja_ventas.set(f"${float(ultimo[3] or 0):.2f}")
+        self.sv_caja_ingresos_extra.set(f"${float(ultimo[4] or 0):.2f}")
+        self.sv_caja_egresos.set(f"${float(ultimo[5] or 0):.2f}")
+        self.sv_caja_saldo_teorico.set(f"${float(ultimo[6] or 0):.2f}")
+        self._caja_saldo_teorico_actual = float(ultimo[6] or 0)
+        if ultimo[7] is not None:
+            self.sv_caja_saldo_real.set(f"{float(ultimo[7]):.2f}")
+        else:
+            self.sv_caja_saldo_real.set("")
+        if ultimo[8] is not None:
+            self.sv_caja_diferencia.set(f"${float(ultimo[8]):.2f}")
+        else:
+            self._conta_recalcular_diferencia_preview()
+
+    def _conta_abrir_caja_ui(self):
+        try:
+            saldo_inicial = float((self.sv_caja_saldo_inicial.get().strip() or "0").replace(",", "."))
+        except ValueError:
+            messagebox.showerror("Error", "El saldo inicial debe ser un número válido.", parent=self)
+            return
+
+        try:
+            corte_id = self.abrir_caja(saldo_inicial, usuario="admin")
+        except (ValueError, RuntimeError) as e:
+            messagebox.showerror("Caja", str(e), parent=self)
+            return
+        except sqlite3.Error as e:
+            messagebox.showerror("Error de base de datos",
+                                 f"No se pudo abrir la caja.\nDetalle: {e}", parent=self)
+            return
+
+        self.sv_caja_saldo_real.set("")
+        self.sv_caja_diferencia.set("$0.00")
+        self._conta_refrescar_resumen_caja_ui()
+        messagebox.showinfo("Caja abierta",
+                            f"Caja #{corte_id} abierta con saldo inicial ${saldo_inicial:.2f}.",
+                            parent=self)
+
+    def _conta_cerrar_caja_ui(self):
+        try:
+            saldo_real = float((self.sv_caja_saldo_real.get().strip() or "0").replace(",", "."))
+        except ValueError:
+            messagebox.showerror("Error", "El saldo real debe ser un número válido.", parent=self)
+            return
+        if saldo_real < 0:
+            messagebox.showerror("Error", "El saldo real no puede ser negativo.", parent=self)
+            return
+
+        saldo_teorico = float(getattr(self, "_caja_saldo_teorico_actual", 0.0) or 0.0)
+        try:
+            diferencia = self.cerrar_caja(saldo_real, usuario="admin")
+        except (ValueError, RuntimeError) as e:
+            messagebox.showerror("Caja", str(e), parent=self)
+            return
+        except sqlite3.Error as e:
+            messagebox.showerror("Error de base de datos",
+                                 f"No se pudo cerrar la caja.\nDetalle: {e}", parent=self)
+            return
+
+        self._conta_refrescar_resumen_caja_ui()
+        messagebox.showinfo(
+            "Caja cerrada",
+            f"Saldo teórico: ${saldo_teorico:.2f}\n"
+            f"Saldo real: ${saldo_real:.2f}\n"
+            f"Diferencia: ${float(diferencia):.2f}",
+            parent=self
+        )
+
+    def _rango_fechas_conta(self):
+        ini = datetime.date.fromisoformat(self.sv_conta_ini.get().strip())
+        fin = datetime.date.fromisoformat(self.sv_conta_fin.get().strip())
+        if fin < ini:
+            raise ValueError("La fecha final no puede ser menor a la inicial.")
+        return ini.isoformat(), fin.isoformat(), f"{ini} 00:00:00", f"{fin} 23:59:59"
+
+    def _on_conta_tipo_change(self, event=None):
+        tipo = self.sv_conta_tipo.get().strip().upper()
+        subtipos = self._opciones_subtipo_por_tipo(tipo)
+        self.cmb_conta_subtipo["values"] = tuple(subtipos)
+        if self.sv_conta_subtipo.get() not in subtipos:
+            self.sv_conta_subtipo.set(subtipos[0] if subtipos else "")
+        self._on_conta_subtipo_change()
+
+    def _on_conta_subtipo_change(self, event=None):
+        tipo = self.sv_conta_tipo.get().strip().upper()
+        subtipo = self.sv_conta_subtipo.get().strip().upper()
+        cats = self._categorias_por_tipo(tipo)
+        self.cmb_conta_categoria["values"] = tuple(cats)
+        preferida = self._categoria_default(tipo, subtipo)
+        if preferida in cats:
+            self.sv_conta_categoria.set(preferida)
+        elif cats and self.sv_conta_categoria.get() not in cats:
+            self.sv_conta_categoria.set(cats[0])
+        elif not cats:
+            self.sv_conta_categoria.set("")
+
+    def _limpiar_form_contabilidad(self):
+        self.sv_conta_tipo.set("EGRESO")
+        self.sv_conta_subtipo.set("GASTO")
+        self.sv_conta_categoria.set("")
+        self.sv_conta_metodo.set("EFECTIVO")
+        self.sv_conta_concepto.set("")
+        self.sv_conta_monto.set("")
+        self.sv_conta_ref.set("")
+        self._on_conta_tipo_change()
+
+    def _registrar_movimiento_desde_form(self):
+        try:
+            tipo = self.sv_conta_tipo.get().strip().upper()
+            subtipo = self.sv_conta_subtipo.get().strip().upper()
+            categoria = self.sv_conta_categoria.get().strip()
+            concepto = self.sv_conta_concepto.get().strip()
+            metodo = self.sv_conta_metodo.get().strip().upper() or "EFECTIVO"
+            referencia = self.sv_conta_ref.get().strip()
+            monto = float((self.sv_conta_monto.get().strip() or "0").replace(",", "."))
+        except ValueError:
+            messagebox.showerror("Error", "El monto debe ser un número válido.", parent=self)
+            return
+
+        try:
+            if subtipo == "GASTO" and tipo == "EGRESO":
+                self.registrar_gasto(categoria, concepto, monto, referencia=referencia)
+            elif subtipo == "RETIRO_DUENO" and tipo == "EGRESO":
+                self.registrar_retiro_dueno(monto, concepto or "Retiro de dueño")
+            elif subtipo == "INGRESO_EXTRA" and tipo == "INGRESO":
+                self.registrar_ingreso_extra(categoria, concepto, monto)
+            else:
+                self._registrar_movimiento_caja(
+                    tipo=tipo, subtipo=subtipo, categoria=categoria, concepto=concepto,
+                    monto=monto, metodo_pago=metodo, referencia=referencia
+                )
+        except ValueError as e:
+            messagebox.showerror("Error", str(e), parent=self)
+            return
+        except sqlite3.Error as e:
+            messagebox.showerror("Error de base de datos",
+                                 f"No se pudo registrar el movimiento.\nDetalle: {e}", parent=self)
+            return
+
+        messagebox.showinfo("OK", "Movimiento contable registrado.", parent=self)
+        self.sv_conta_concepto.set("")
+        self.sv_conta_monto.set("")
+        self.sv_conta_ref.set("")
+        self._cargar_tabla_contabilidad()
+
+    def _cargar_contabilidad_vista(self):
+        if not hasattr(self, "tabla_conta"):
+            return
+        self._cargar_categorias_contables_cache()
+        self._on_conta_tipo_change()
+        self._cargar_tabla_contabilidad()
+
+    def _cargar_tabla_contabilidad(self):
+        if not hasattr(self, "tabla_conta"):
+            return
+        try:
+            _ini, _fin, inicio, fin = self._rango_fechas_conta()
+        except ValueError as e:
+            messagebox.showerror("Fechas inválidas", str(e), parent=self)
+            return
+
+        for row in self.tabla_conta.get_children():
+            self.tabla_conta.delete(row)
+
+        with get_conn() as conn:
+            rows = conn.execute(
+                "SELECT id,fecha,tipo,subtipo,categoria,concepto,metodo_pago,monto,venta_id,referencia"
+                " FROM movimientos_caja"
+                " WHERE fecha >= ? AND fecha <= ?"
+                " ORDER BY id DESC LIMIT 500",
+                (inicio, fin)
+            ).fetchall()
+            sums = conn.execute(
+                "SELECT"
+                " IFNULL(SUM(CASE WHEN tipo='INGRESO' THEN monto END),0),"
+                " IFNULL(SUM(CASE WHEN tipo='EGRESO' THEN monto END),0)"
+                " FROM movimientos_caja WHERE fecha >= ? AND fecha <= ?",
+                (inicio, fin)
+            ).fetchone()
+
+        for r in rows:
+            tag = "ing" if r[2] == "INGRESO" else "egr"
+            monto_txt = f"${float(r[7]):.2f}"
+            venta_txt = r[8] if r[8] is not None else "-"
+            self.tabla_conta.insert(
+                "", "end", iid=str(r[0]),
+                values=(r[0], r[1], r[2], r[3], r[4], r[5], r[6], monto_txt, venta_txt, r[9] or "-"),
+                tags=(tag,)
+            )
+
+        ingresos = float(sums[0] or 0)
+        egresos = float(sums[1] or 0)
+        flujo = ingresos - egresos
+        self.kpi_ingresos.config(text=f"${ingresos:.2f}")
+        self.kpi_egresos.config(text=f"${egresos:.2f}")
+        self.kpi_flujo.config(text=f"${flujo:.2f}")
+        self._conta_refrescar_resumen_caja_ui()
+
+    def _exportar_libro_diario_csv_ui(self):
+        try:
+            fecha_ini, fecha_fin, _inicio, _fin = self._rango_fechas_conta()
+        except ValueError as e:
+            messagebox.showerror("Fechas inválidas", str(e), parent=self)
+            return
+
+        base = os.path.dirname(os.path.abspath(__file__))
+        carpeta = os.path.join(base, "respaldos_csv", "contabilidad")
+        os.makedirs(carpeta, exist_ok=True)
+        ts = datetime.datetime.now().strftime("%Y%m%d_%H%M%S")
+        ruta = os.path.join(carpeta, f"libro_diario_{fecha_ini}_{fecha_fin}_{ts}.csv")
+        try:
+            total = self.exportar_libro_diario_csv(fecha_ini, fecha_fin, ruta)
+        except Exception as e:
+            messagebox.showerror("Error de exportación",
+                                 f"No se pudo exportar el libro diario.\nDetalle: {e}", parent=self)
+            return
+        messagebox.showinfo(
+            "✔ Exportación contable",
+            f"Movimientos exportados: {total}\n\nArchivo:\n{ruta}",
+            parent=self
+        )
+
+    def _exportar_resumen_mensual_csv_ui(self):
+        try:
+            _fecha_ini, fecha_fin, _inicio, _fin = self._rango_fechas_conta()
+            fecha_ref = datetime.date.fromisoformat(fecha_fin)
+        except ValueError as e:
+            messagebox.showerror("Fechas inválidas", str(e), parent=self)
+            return
+
+        base = os.path.dirname(os.path.abspath(__file__))
+        carpeta = os.path.join(base, "respaldos_csv", "contabilidad")
+        os.makedirs(carpeta, exist_ok=True)
+        ts = datetime.datetime.now().strftime("%Y%m%d_%H%M%S")
+        anio, mes = fecha_ref.year, fecha_ref.month
+        ruta = os.path.join(carpeta, f"resumen_mensual_{anio:04d}-{mes:02d}_{ts}.csv")
+
+        try:
+            total = self.exportar_resumen_mensual_csv(anio, mes, ruta)
+        except Exception as e:
+            messagebox.showerror("Error de exportación",
+                                 f"No se pudo exportar el resumen mensual.\nDetalle: {e}",
+                                 parent=self)
+            return
+
+        messagebox.showinfo(
+            "✔ Exportación contable",
+            f"Mes exportado: {anio:04d}-{mes:02d}\n"
+            f"Registros: {total}\n\n"
+            f"Archivo:\n{ruta}",
+            parent=self
+        )
+
+    def _exportar_cortes_caja_csv_ui(self):
+        try:
+            fecha_ini, fecha_fin, _inicio, _fin = self._rango_fechas_conta()
+        except ValueError as e:
+            messagebox.showerror("Fechas inválidas", str(e), parent=self)
+            return
+
+        base = os.path.dirname(os.path.abspath(__file__))
+        carpeta = os.path.join(base, "respaldos_csv", "contabilidad")
+        os.makedirs(carpeta, exist_ok=True)
+        ts = datetime.datetime.now().strftime("%Y%m%d_%H%M%S")
+        ruta = os.path.join(carpeta, f"cortes_caja_{fecha_ini}_{fecha_fin}_{ts}.csv")
+        try:
+            total = self.exportar_cortes_caja_csv(fecha_ini, fecha_fin, ruta)
+        except Exception as e:
+            messagebox.showerror("Error de exportación",
+                                 f"No se pudo exportar cortes de caja.\nDetalle: {e}", parent=self)
+            return
+        messagebox.showinfo(
+            "✔ Exportación contable",
+            f"Cortes exportados: {total}\n\nArchivo:\n{ruta}",
+            parent=self
+        )
+
+    # ══════════════════════════════════════════════════════
     #  PÁGINA: HISTORIAL
     # ══════════════════════════════════════════════════════
     def _build_page_historial(self):
@@ -2166,6 +3254,10 @@ class PuntoDeVenta(tk.Tk):
                     "DELETE FROM detalle_venta WHERE venta_id = ?", (venta_id,)
                 )
                 conn.execute(
+                    "DELETE FROM movimientos_caja WHERE venta_id = ?",
+                    (venta_id,)
+                )
+                conn.execute(
                     "DELETE FROM ventas WHERE id = ?", (venta_id,)
                 )
                 if venta_row and venta_row[0] is not None:
@@ -2201,6 +3293,8 @@ class PuntoDeVenta(tk.Tk):
         if hasattr(self, "tabla_clientes"):
             self._cargar_tabla_clientes()
         self._cargar_clientes_en_venta()
+        if hasattr(self, "tabla_conta"):
+            self._cargar_tabla_contabilidad()
         messagebox.showinfo(
             "✔ Venta eliminada",
             f"La venta #{venta_id} fue eliminada correctamente.",
