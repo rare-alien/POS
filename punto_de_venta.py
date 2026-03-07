@@ -72,7 +72,20 @@ def init_db():
             CREATE TABLE IF NOT EXISTS ventas (
                 id         INTEGER PRIMARY KEY AUTOINCREMENT,
                 fecha      TEXT    NOT NULL,
-                total      REAL    NOT NULL DEFAULT 0
+                total      REAL    NOT NULL DEFAULT 0,
+                cliente_id INTEGER DEFAULT NULL,
+                FOREIGN KEY (cliente_id) REFERENCES clientes(id)
+            );
+
+            CREATE TABLE IF NOT EXISTS clientes (
+                id            INTEGER PRIMARY KEY AUTOINCREMENT,
+                nombre        TEXT    NOT NULL,
+                telefono      TEXT    DEFAULT '',
+                email         TEXT    DEFAULT '',
+                notas         TEXT    DEFAULT '',
+                ultima_visita TEXT    DEFAULT NULL,
+                total_compras REAL    NOT NULL DEFAULT 0,
+                fecha_alta    TEXT    NOT NULL DEFAULT (datetime('now','localtime'))
             );
 
             CREATE TABLE IF NOT EXISTS detalle_venta (
@@ -95,9 +108,16 @@ def init_db():
             "ALTER TABLE productos ADD COLUMN costo REAL NOT NULL DEFAULT 0",
             "ALTER TABLE productos ADD COLUMN a_granel INTEGER NOT NULL DEFAULT 0",
             "ALTER TABLE productos ADD COLUMN caducidad TEXT DEFAULT NULL",
+            "ALTER TABLE ventas ADD COLUMN cliente_id INTEGER DEFAULT NULL",
             "ALTER TABLE detalle_venta ADD COLUMN costo REAL NOT NULL DEFAULT 0",
             "ALTER TABLE detalle_venta ADD COLUMN ganancia REAL NOT NULL DEFAULT 0",
             "ALTER TABLE detalle_venta ADD COLUMN es_granel INTEGER NOT NULL DEFAULT 0",
+            "ALTER TABLE clientes ADD COLUMN telefono TEXT DEFAULT ''",
+            "ALTER TABLE clientes ADD COLUMN email TEXT DEFAULT ''",
+            "ALTER TABLE clientes ADD COLUMN notas TEXT DEFAULT ''",
+            "ALTER TABLE clientes ADD COLUMN ultima_visita TEXT DEFAULT NULL",
+            "ALTER TABLE clientes ADD COLUMN total_compras REAL NOT NULL DEFAULT 0",
+            "ALTER TABLE clientes ADD COLUMN fecha_alta TEXT NOT NULL DEFAULT (datetime('now','localtime'))",
         ]:
             try:
                 conn.execute(sql)
@@ -394,8 +414,11 @@ class PuntoDeVenta(tk.Tk):
         self.option_add("*Font", "Courier 12")
         self.carrito = []
         self._alertas_caducidad_notificadas = set()
+        self._clientes_cache = []
+        self._cliente_id_por_opcion = {"Público general": None}
         self._build_ui()
         self._cargar_productos()
+        self._cargar_clientes_en_venta()
         self.after(200, self._verificar_contrasena_inicial)
 
     # ── UI principal ──────────────────────────────────────
@@ -413,6 +436,7 @@ class PuntoDeVenta(tk.Tk):
         nav_frame.pack(side="right")
         for label, cmd in [("🛒  Ventas", self._show_ventas),
                            ("📦  Productos", self._show_productos),
+                           ("👥  CRM", self._show_crm),
                            ("📊  Historial", self._show_historial)]:
             b = tk.Button(nav_frame, text=label, bg=C["panel"], fg=C["muted"],
                           bd=0, padx=16, pady=6, cursor="hand2",
@@ -430,6 +454,7 @@ class PuntoDeVenta(tk.Tk):
         self.pages = {}
         self._build_page_ventas()
         self._build_page_productos()
+        self._build_page_crm()
         self._build_page_historial()
         self._show_ventas()
 
@@ -438,7 +463,7 @@ class PuntoDeVenta(tk.Tk):
             p.pack_forget()
         self.pages[name].pack(fill="both", expand=True)
         labels = {"ventas": "🛒  Ventas", "productos": "📦  Productos",
-                  "historial": "📊  Historial"}
+                  "crm": "👥  CRM", "historial": "📊  Historial"}
         for k, b in self.nav_btns.items():
             b.config(fg=C["accent"] if k == labels[name] else C["muted"],
                      bg=C["card"] if k == labels[name] else C["panel"])
@@ -451,6 +476,9 @@ class PuntoDeVenta(tk.Tk):
             cod = self._prod_entries["e_codigo"].get().strip()
             if not cod:
                 self._autocodigo()
+    def _show_crm(self):
+        self._cargar_tabla_clientes()
+        self._show_page("crm")
     def _show_historial(self): self._cargar_historial(); self._show_page("historial")
 
     # ══════════════════════════════════════════════════════
@@ -532,6 +560,21 @@ class PuntoDeVenta(tk.Tk):
 
         tk.Label(right, text="CARRITO DE VENTA", fg=C["muted"],
                  bg=C["panel"], font=("Courier", 9, "bold")).pack(anchor="w")
+
+        cliente_f = tk.Frame(right, bg=C["panel"])
+        cliente_f.pack(fill="x", pady=(8, 4))
+        tk.Label(cliente_f, text="Cliente (opcional)", fg=C["muted"], bg=C["panel"],
+                 font=("Courier", 9)).pack(anchor="w")
+        self.sv_cliente_venta = tk.StringVar(value="Público general")
+        self.cmb_cliente_venta = ttk.Combobox(
+            cliente_f,
+            textvariable=self.sv_cliente_venta,
+            state="readonly",
+            font=("Courier", 10)
+        )
+        self.cmb_cliente_venta.pack(fill="x", ipady=4, pady=(2, 0))
+        self.cmb_cliente_venta["values"] = ("Público general",)
+        self.cmb_cliente_venta.current(0)
 
         tk.Frame(right, bg=C["border"], height=1).pack(fill="x", pady=8)
 
@@ -919,28 +962,130 @@ class PuntoDeVenta(tk.Tk):
             f"¿Registrar venta por ${total:.2f}?", parent=self)
         if not confirm:
             return
-        with get_conn() as conn:
-            fecha = datetime.datetime.now().strftime("%Y-%m-%d %H:%M:%S")
-            cur = conn.execute("INSERT INTO ventas (fecha,total) VALUES (?,?)",
-                               (fecha, total))
+        cliente_id = self._cliente_id_venta_actual()
+        venta_id = None
+        fecha = datetime.datetime.now().strftime("%Y-%m-%d %H:%M:%S")
+        conn = None
+        try:
+            conn = get_conn()
+            conn.execute("BEGIN")
+            cur = conn.execute(
+                "INSERT INTO ventas (fecha,total,cliente_id) VALUES (?,?,?)",
+                (fecha, total, cliente_id)
+            )
             venta_id = cur.lastrowid
+
             for item in self.carrito:
-                sub      = item["precio"] * item["cantidad"]
+                sub = item["precio"] * item["cantidad"]
                 ganancia = (item["precio"] - item["costo"]) * item["cantidad"]
+                row_stock = conn.execute(
+                    "SELECT stock FROM productos WHERE id = ?",
+                    (item["id"],)
+                ).fetchone()
+                if not row_stock:
+                    raise RuntimeError(f'El producto "{item["nombre"]}" no existe en la base de datos.')
+                stock_actual = float(row_stock[0])
+                if stock_actual + 1e-9 < float(item["cantidad"]):
+                    es_granel = bool(item.get("es_granel", False))
+                    raise RuntimeError(
+                        f'Stock insuficiente para "{item["nombre"]}". '
+                        f'Disponible: {self._fmt_unidades(stock_actual, es_granel, es_granel)}'
+                    )
+
                 conn.execute(
                     "INSERT INTO detalle_venta"
                     " (venta_id,producto_id,nombre,precio,costo,cantidad,subtotal,ganancia,es_granel)"
                     " VALUES (?,?,?,?,?,?,?,?,?)",
-                    (venta_id, item["id"], item["nombre"],
-                     item["precio"], item["costo"], item["cantidad"], sub, ganancia,
-                     int(bool(item.get("es_granel", False)))))
-                conn.execute("UPDATE productos SET stock = stock - ? WHERE id = ?",
-                             (item["cantidad"], item["id"]))
+                    (
+                        venta_id, item["id"], item["nombre"], item["precio"], item["costo"],
+                        item["cantidad"], sub, ganancia, int(bool(item.get("es_granel", False)))
+                    )
+                )
+                conn.execute(
+                    "UPDATE productos SET stock = stock - ? WHERE id = ?",
+                    (item["cantidad"], item["id"])
+                )
+
+            if cliente_id is not None:
+                conn.execute(
+                    "UPDATE clientes"
+                    " SET ultima_visita = ?, total_compras = IFNULL(total_compras,0) + ?"
+                    " WHERE id = ?",
+                    (fecha, total, cliente_id)
+                )
+
+            conn.commit()
+        except RuntimeError as e:
+            if conn:
+                conn.rollback()
+            messagebox.showwarning("Venta no registrada", str(e), parent=self)
+            return
+        except sqlite3.Error as e:
+            if conn:
+                conn.rollback()
+            messagebox.showerror(
+                "Error de base de datos",
+                f"No se pudo registrar la venta.\nDetalle técnico: {e}",
+                parent=self
+            )
+            return
+        except Exception as e:
+            if conn:
+                conn.rollback()
+            messagebox.showerror(
+                "Error inesperado",
+                f"No se pudo completar la venta.\nDetalle: {e}",
+                parent=self
+            )
+            return
+        finally:
+            if conn:
+                conn.close()
+
         messagebox.showinfo("✔ Venta registrada",
             f"Venta #{venta_id} guardada.\nTotal: ${total:.2f}", parent=self)
         self.carrito.clear()
         self._refresh_carrito()
         self._cargar_productos()
+        if hasattr(self, "tabla_clientes"):
+            self._cargar_tabla_clientes()
+        self._cargar_clientes_en_venta()
+
+    def _cliente_id_venta_actual(self):
+        if not hasattr(self, "sv_cliente_venta"):
+            return None
+        opcion = self.sv_cliente_venta.get().strip()
+        return self._cliente_id_por_opcion.get(opcion)
+
+    def _cargar_clientes_cache(self):
+        with get_conn() as conn:
+            self._clientes_cache = conn.execute(
+                "SELECT id,nombre,telefono,email,notas,ultima_visita,total_compras"
+                " FROM clientes ORDER BY nombre"
+            ).fetchall()
+
+    def _cargar_clientes_en_venta(self):
+        self._cargar_clientes_cache()
+        if not hasattr(self, "cmb_cliente_venta"):
+            return
+
+        actual = self.sv_cliente_venta.get().strip() if hasattr(self, "sv_cliente_venta") else ""
+        opciones = ["Público general"]
+        self._cliente_id_por_opcion = {"Público general": None}
+
+        for row in self._clientes_cache:
+            cid, nombre, telefono = row[0], row[1], row[2]
+            etiqueta = f"{nombre} · {telefono}" if telefono else nombre
+            if etiqueta in self._cliente_id_por_opcion:
+                etiqueta = f"{etiqueta} (ID {cid})"
+            self._cliente_id_por_opcion[etiqueta] = cid
+            opciones.append(etiqueta)
+
+        self.cmb_cliente_venta["values"] = tuple(opciones)
+        if actual in opciones:
+            self.sv_cliente_venta.set(actual)
+        else:
+            self.sv_cliente_venta.set("Público general")
 
     def _set_caducidad_form(self, valor):
         fecha = (valor or "").strip()
@@ -1454,6 +1599,175 @@ class PuntoDeVenta(tk.Tk):
             f"Guardado en:\n{ruta}", parent=self)
 
     # ══════════════════════════════════════════════════════
+    #  PÁGINA: CRM
+    # ══════════════════════════════════════════════════════
+    def _build_page_crm(self):
+        page = tk.Frame(self.content, bg=C["bg"])
+        self.pages["crm"] = page
+
+        form = tk.Frame(page, bg=C["card"], padx=14, pady=12)
+        form.pack(fill="x", pady=(0,10))
+        tk.Label(form, text="CLIENTES (CRM LOCAL)", fg=C["muted"], bg=C["card"],
+                 font=("Courier", 9, "bold")).grid(row=0, column=0, columnspan=5, sticky="w", pady=(0,8))
+
+        campos = [
+            ("Nombre", "c_nombre"),
+            ("Teléfono", "c_tel"),
+            ("Email", "c_email"),
+            ("Notas", "c_notas"),
+        ]
+        self._cli_entries = {}
+        for col, (lbl, key) in enumerate(campos):
+            tk.Label(form, text=lbl, fg=C["muted"], bg=C["card"],
+                     font=("Courier", 9)).grid(row=1, column=col, sticky="w", padx=(0,4))
+            ent = tk.Entry(form, bg=C["panel"], fg=C["text"],
+                           insertbackground=C["text"], bd=0,
+                           font=("Courier", 11), highlightthickness=1,
+                           highlightbackground=C["border"])
+            ent.grid(row=2, column=col, sticky="ew", padx=(0,8), ipady=6)
+            self._cli_entries[key] = ent
+
+        form.columnconfigure(0, weight=3, minsize=170)
+        form.columnconfigure(1, weight=2, minsize=130)
+        form.columnconfigure(2, weight=3, minsize=190)
+        form.columnconfigure(3, weight=4, minsize=220)
+
+        btns = tk.Frame(form, bg=C["card"])
+        btns.grid(row=2, column=4, sticky="e")
+        tk.Button(btns, text="● Nuevo", bg=C["accent2"], fg=C["white"], bd=0,
+                  font=("Courier", 10), padx=10, pady=6, cursor="hand2",
+                  command=self._nuevo_cliente).pack(side="left", padx=(0,4))
+        tk.Button(btns, text="＋ Guardar", bg=C["accent"], fg=C["white"], bd=0,
+                  font=("Courier", 10, "bold"), padx=10, pady=6, cursor="hand2",
+                  command=self._guardar_cliente).pack(side="left", padx=(0,4))
+        tk.Button(btns, text="✕ Eliminar", bg=C["red"], fg=C["white"], bd=0,
+                  font=("Courier", 10), padx=10, pady=6, cursor="hand2",
+                  command=self._eliminar_cliente).pack(side="left")
+
+        filtro = tk.Frame(page, bg=C["bg"])
+        filtro.pack(fill="x", pady=(0,6))
+        tk.Label(filtro, text="Filtrar cliente:", fg=C["muted"], bg=C["bg"],
+                 font=("Courier", 10)).pack(side="left")
+        self.sv_cli_filter = tk.StringVar()
+        self.sv_cli_filter.trace_add("write", lambda *a: self._cargar_tabla_clientes())
+        tk.Entry(filtro, textvariable=self.sv_cli_filter,
+                 bg=C["panel"], fg=C["text"], insertbackground=C["text"],
+                 bd=0, font=("Courier", 10), highlightthickness=1,
+                 highlightbackground=C["border"], width=32).pack(side="left", padx=(8,0), ipady=5)
+
+        frame_t = tk.Frame(page, bg=C["bg"])
+        frame_t.pack(fill="both", expand=True)
+        cols = ("id", "nombre", "tel", "email", "ultima", "total")
+        heads = ("ID", "Nombre", "Teléfono", "Email", "Última visita", "Total compras")
+        widths = [45, 200, 130, 200, 130, 120]
+        self.tabla_clientes = ttk.Treeview(frame_t, columns=cols, show="headings",
+                                           style="POS.Treeview", selectmode="browse")
+        for c, h, w in zip(cols, heads, widths):
+            self.tabla_clientes.heading(c, text=h, anchor="center")
+            self.tabla_clientes.column(c, width=w, anchor="center", stretch=True)
+        sb = ttk.Scrollbar(frame_t, orient="vertical", command=self.tabla_clientes.yview)
+        self.tabla_clientes.configure(yscrollcommand=sb.set)
+        self.tabla_clientes.pack(side="left", fill="both", expand=True)
+        sb.pack(side="right", fill="y")
+        self.tabla_clientes.bind("<<TreeviewSelect>>", self._llenar_form_cliente)
+
+    def _cargar_tabla_clientes(self):
+        if not hasattr(self, "tabla_clientes"):
+            return
+        q = self.sv_cli_filter.get().strip().lower() if hasattr(self, "sv_cli_filter") else ""
+        self._cargar_clientes_cache()
+        for row in self.tabla_clientes.get_children():
+            self.tabla_clientes.delete(row)
+        for r in self._clientes_cache:
+            cid, nombre, tel, email, notas, ultima, total = r
+            if q and q not in nombre.lower() and q not in (tel or "").lower() and q not in (email or "").lower():
+                continue
+            ultima_txt = (ultima or "")[:10] if ultima else "-"
+            self.tabla_clientes.insert(
+                "",
+                "end",
+                iid=str(cid),
+                values=(cid, nombre, tel or "-", email or "-", ultima_txt, f"${(total or 0):.2f}")
+            )
+
+    def _llenar_form_cliente(self, event=None):
+        if not hasattr(self, "tabla_clientes"):
+            return
+        sel = self.tabla_clientes.selection()
+        if not sel:
+            return
+        cid = int(sel[0])
+        row = next((r for r in self._clientes_cache if r[0] == cid), None)
+        if not row:
+            return
+        _, nombre, tel, email, notas, _ultima, _total = row
+        datos = {
+            "c_nombre": nombre or "",
+            "c_tel": tel or "",
+            "c_email": email or "",
+            "c_notas": notas or "",
+        }
+        for key, val in datos.items():
+            self._cli_entries[key].delete(0, "end")
+            self._cli_entries[key].insert(0, val)
+        self._cliente_editing_id = cid
+
+    def _nuevo_cliente(self):
+        self._cliente_editing_id = None
+        if not hasattr(self, "_cli_entries"):
+            return
+        for ent in self._cli_entries.values():
+            ent.delete(0, "end")
+        self._cli_entries["c_nombre"].focus()
+
+    def _guardar_cliente(self):
+        if not hasattr(self, "_cli_entries"):
+            return
+        nombre = self._cli_entries["c_nombre"].get().strip()
+        tel = self._cli_entries["c_tel"].get().strip()
+        email = self._cli_entries["c_email"].get().strip()
+        notas = self._cli_entries["c_notas"].get().strip()
+        if not nombre:
+            messagebox.showerror("Error", "El nombre del cliente es obligatorio.", parent=self)
+            return
+
+        eid = getattr(self, "_cliente_editing_id", None)
+        with get_conn() as conn:
+            if eid:
+                conn.execute(
+                    "UPDATE clientes SET nombre=?,telefono=?,email=?,notas=? WHERE id=?",
+                    (nombre, tel, email, notas, eid)
+                )
+                msg = "Cliente actualizado."
+            else:
+                conn.execute(
+                    "INSERT INTO clientes (nombre,telefono,email,notas) VALUES (?,?,?,?)",
+                    (nombre, tel, email, notas)
+                )
+                msg = "Cliente agregado."
+        messagebox.showinfo("OK", msg, parent=self)
+        self._nuevo_cliente()
+        self._cargar_tabla_clientes()
+        self._cargar_clientes_en_venta()
+
+    def _eliminar_cliente(self):
+        eid = getattr(self, "_cliente_editing_id", None)
+        if not eid:
+            messagebox.showinfo("Selecciona un cliente", "Primero selecciona un cliente de la tabla.", parent=self)
+            return
+        nombre = self._cli_entries["c_nombre"].get().strip() or "?"
+        if not messagebox.askyesno("Eliminar cliente",
+                                   f'¿Eliminar "{nombre}"? Las ventas quedarán como cliente anónimo.',
+                                   parent=self):
+            return
+        with get_conn() as conn:
+            conn.execute("UPDATE ventas SET cliente_id = NULL WHERE cliente_id = ?", (eid,))
+            conn.execute("DELETE FROM clientes WHERE id = ?", (eid,))
+        self._nuevo_cliente()
+        self._cargar_tabla_clientes()
+        self._cargar_clientes_en_venta()
+
+    # ══════════════════════════════════════════════════════
     #  PÁGINA: HISTORIAL
     # ══════════════════════════════════════════════════════
     def _build_page_historial(self):
@@ -1495,7 +1809,7 @@ class PuntoDeVenta(tk.Tk):
         self.kpi_total    = self._kpi_box(self.kpi_frame, "TOTAL HOY",    "$0.00",  C["green"])
         self.kpi_ganancia = self._kpi_box(self.kpi_frame, "GANANCIA HOY", "$0.00",  C["yellow"])
 
-        cols_v = ("id","fecha","total")
+        cols_v = ("id","fecha","cliente","total")
         fr1 = tk.Frame(page, bg=C["bg"])
         fr1.pack(fill="both", expand=True)
 
@@ -1510,7 +1824,7 @@ class PuntoDeVenta(tk.Tk):
 
         self.tabla_hist = ttk.Treeview(left_h, columns=cols_v, show="headings",
                                        style="POS.Treeview", height=8)
-        for c,h,w in zip(cols_v,("ID","Fecha","Total"),(40,150,80)):
+        for c,h,w in zip(cols_v,("ID","Fecha","Cliente","Total"),(40,150,170,80)):
             self.tabla_hist.heading(c, text=h, anchor="center")
             self.tabla_hist.column(c, width=w, anchor="center", stretch=True)
         sb = ttk.Scrollbar(left_h, orient="vertical", command=self.tabla_hist.yview)
@@ -1564,11 +1878,18 @@ class PuntoDeVenta(tk.Tk):
         with get_conn() as conn:
             if f:
                 rows = conn.execute(
-                    "SELECT id,fecha,total FROM ventas WHERE fecha LIKE ? ORDER BY id DESC",
+                    "SELECT v.id,v.fecha,IFNULL(c.nombre,'Público general') AS cliente,v.total"
+                    " FROM ventas v"
+                    " LEFT JOIN clientes c ON c.id = v.cliente_id"
+                    " WHERE v.fecha LIKE ?"
+                    " ORDER BY v.id DESC",
                     (f"%{f}%",)).fetchall()
             else:
                 rows = conn.execute(
-                    "SELECT id,fecha,total FROM ventas ORDER BY id DESC LIMIT 200"
+                    "SELECT v.id,v.fecha,IFNULL(c.nombre,'Público general') AS cliente,v.total"
+                    " FROM ventas v"
+                    " LEFT JOIN clientes c ON c.id = v.cliente_id"
+                    " ORDER BY v.id DESC LIMIT 200"
                 ).fetchall()
             kpi = conn.execute(
                 "SELECT COUNT(*), IFNULL(SUM(v.total),0),"
@@ -1579,7 +1900,7 @@ class PuntoDeVenta(tk.Tk):
                 (f"{today}%",)).fetchone()
         for r in rows:
             self.tabla_hist.insert("","end",
-                values=(r[0],r[1],f"${r[2]:.2f}"), iid=str(r[0]))
+                values=(r[0],r[1],r[2],f"${r[3]:.2f}"), iid=str(r[0]))
         if hasattr(self,"kpi_ventas"):
             self.kpi_ventas.config(text=str(kpi[0]))
             self.kpi_total.config(text=f"${kpi[1]:.2f}")
@@ -1612,9 +1933,10 @@ class PuntoDeVenta(tk.Tk):
             with get_conn() as conn:
                 cursor = conn.cursor()
                 cursor.execute("""
-                    SELECT v.id, v.fecha, v.total,
+                    SELECT v.id, v.fecha, IFNULL(c.nombre,'Público general') AS cliente, v.total,
                            dv.nombre, dv.cantidad, dv.precio, dv.subtotal, dv.ganancia
                     FROM ventas v
+                    LEFT JOIN clientes c ON c.id = v.cliente_id
                     LEFT JOIN detalle_venta dv ON v.id = dv.venta_id
                     ORDER BY v.id DESC
                 """)
@@ -1622,7 +1944,7 @@ class PuntoDeVenta(tk.Tk):
             with open(ruta_completa, mode="w", newline="", encoding="utf-8") as archivo_csv:
                 escritor = csv.writer(archivo_csv)
                 escritor.writerow([
-                    "ID_Venta", "Fecha_Venta", "Total_Venta",
+                    "ID_Venta", "Fecha_Venta", "Cliente", "Total_Venta",
                     "Producto", "Cantidad", "Precio_Unitario", "Subtotal_Producto", "Ganancia_Producto"
                 ])
                 escritor.writerows(filas)
@@ -1818,7 +2140,7 @@ class PuntoDeVenta(tk.Tk):
         vals = self.tabla_hist.item(sel[0], "values")
         venta_id   = int(vals[0])
         venta_fecha = vals[1]
-        venta_total = vals[2]
+        venta_total = vals[3]
         password_ok = self._pedir_y_validar_password(venta_id, venta_fecha, venta_total)
         if not password_ok:
             return
@@ -1836,12 +2158,36 @@ class PuntoDeVenta(tk.Tk):
             return
         try:
             with get_conn() as conn:
+                venta_row = conn.execute(
+                    "SELECT cliente_id,total FROM ventas WHERE id = ?",
+                    (venta_id,)
+                ).fetchone()
                 conn.execute(
                     "DELETE FROM detalle_venta WHERE venta_id = ?", (venta_id,)
                 )
                 conn.execute(
                     "DELETE FROM ventas WHERE id = ?", (venta_id,)
                 )
+                if venta_row and venta_row[0] is not None:
+                    cliente_id = int(venta_row[0])
+                    total_venta = float(venta_row[1] or 0)
+                    conn.execute(
+                        "UPDATE clientes"
+                        " SET total_compras = CASE"
+                        "     WHEN IFNULL(total_compras,0) - ? < 0 THEN 0"
+                        "     ELSE IFNULL(total_compras,0) - ?"
+                        " END"
+                        " WHERE id = ?",
+                        (total_venta, total_venta, cliente_id)
+                    )
+                    ultima = conn.execute(
+                        "SELECT MAX(fecha) FROM ventas WHERE cliente_id = ?",
+                        (cliente_id,)
+                    ).fetchone()[0]
+                    conn.execute(
+                        "UPDATE clientes SET ultima_visita = ? WHERE id = ?",
+                        (ultima, cliente_id)
+                    )
         except sqlite3.Error as e:
             messagebox.showerror(
                 "Error de base de datos",
@@ -1852,6 +2198,9 @@ class PuntoDeVenta(tk.Tk):
         for row in self.tabla_det.get_children():
             self.tabla_det.delete(row)
         self._cargar_historial()
+        if hasattr(self, "tabla_clientes"):
+            self._cargar_tabla_clientes()
+        self._cargar_clientes_en_venta()
         messagebox.showinfo(
             "✔ Venta eliminada",
             f"La venta #{venta_id} fue eliminada correctamente.",
