@@ -65,7 +65,8 @@ def init_db():
                 costo     REAL    NOT NULL DEFAULT 0,
                 stock     REAL    NOT NULL DEFAULT 0,
                 categoria TEXT    DEFAULT 'General',
-                a_granel  INTEGER NOT NULL DEFAULT 0
+                a_granel  INTEGER NOT NULL DEFAULT 0,
+                caducidad TEXT    DEFAULT NULL
             );
 
             CREATE TABLE IF NOT EXISTS ventas (
@@ -93,6 +94,7 @@ def init_db():
         for sql in [
             "ALTER TABLE productos ADD COLUMN costo REAL NOT NULL DEFAULT 0",
             "ALTER TABLE productos ADD COLUMN a_granel INTEGER NOT NULL DEFAULT 0",
+            "ALTER TABLE productos ADD COLUMN caducidad TEXT DEFAULT NULL",
             "ALTER TABLE detalle_venta ADD COLUMN costo REAL NOT NULL DEFAULT 0",
             "ALTER TABLE detalle_venta ADD COLUMN ganancia REAL NOT NULL DEFAULT 0",
             "ALTER TABLE detalle_venta ADD COLUMN es_granel INTEGER NOT NULL DEFAULT 0",
@@ -391,6 +393,7 @@ class PuntoDeVenta(tk.Tk):
         self.configure(bg=C["bg"])
         self.option_add("*Font", "Courier 12")
         self.carrito = []
+        self._alertas_caducidad_notificadas = set()
         self._build_ui()
         self._cargar_productos()
         self.after(200, self._verificar_contrasena_inicial)
@@ -588,6 +591,65 @@ class PuntoDeVenta(tk.Tk):
             return f"{txt} kg" if con_unidad else txt
         return str(int(round(num)))
 
+    def _estado_caducidad(self, fecha_txt):
+        fecha_txt = (fecha_txt or "").strip()
+        if not fecha_txt:
+            return False, None
+        try:
+            fecha = datetime.date.fromisoformat(fecha_txt)
+        except ValueError:
+            return False, None
+        dias = (fecha - datetime.date.today()).days
+        return dias <= 30, dias
+
+    def _texto_estado_caducidad(self, dias):
+        if dias is None:
+            return "Sin fecha"
+        if dias < 0:
+            return f"Vencido ({abs(dias)}d)"
+        if dias <= 30:
+            return f"CRITICO ({dias}d)"
+        return f"OK ({dias}d)"
+
+    def _clave_prioridad_salida(self, fecha_txt, nombre):
+        es_critico, dias = self._estado_caducidad(fecha_txt)
+        if es_critico:
+            return (0, dias, nombre.lower())
+        if dias is not None:
+            return (1, dias, nombre.lower())
+        return (2, 999999, nombre.lower())
+
+    def _avisar_caducidades_criticas(self, productos):
+        criticos_nuevos = []
+        for prod in productos:
+            pid, codigo, nombre, _precio, _costo, _stock, _a_granel, caducidad = prod
+            es_critico, dias = self._estado_caducidad(caducidad)
+            if not es_critico:
+                continue
+            clave_alerta = (pid, caducidad)
+            if clave_alerta in self._alertas_caducidad_notificadas:
+                continue
+            self._alertas_caducidad_notificadas.add(clave_alerta)
+            criticos_nuevos.append((codigo, nombre, dias, caducidad))
+
+        if not criticos_nuevos:
+            return
+
+        lineas = []
+        for codigo, nombre, dias, cad in criticos_nuevos[:12]:
+            estado = "VENCIDO" if dias < 0 else f"caduca en {dias} día(s)"
+            lineas.append(f"- {codigo} | {nombre} | {cad} | {estado}")
+        extra = len(criticos_nuevos) - 12
+        if extra > 0:
+            lineas.append(f"... y {extra} producto(s) adicional(es).")
+
+        messagebox.showwarning(
+            "⚠ Productos críticos por caducidad",
+            "Los siguientes productos están en estado CRÍTICO (menos de 1 mes para caducar) "
+            "y deben salir con prioridad:\n\n" + "\n".join(lineas),
+            parent=self
+        )
+
     def _pedir_cantidad_granel(self, nombre, precio, stock_disponible):
         dlg = tk.Toplevel(self)
         dlg.title("Producto a granel")
@@ -716,9 +778,14 @@ class PuntoDeVenta(tk.Tk):
         self._productos_cache = []
         with get_conn() as conn:
             rows = conn.execute(
-                "SELECT id,codigo,nombre,precio,costo,stock,a_granel FROM productos ORDER BY nombre"
+                "SELECT id,codigo,nombre,precio,costo,stock,a_granel,caducidad"
+                " FROM productos ORDER BY nombre"
             ).fetchall()
-        self._productos_cache = rows
+        self._productos_cache = sorted(
+            rows,
+            key=lambda p: self._clave_prioridad_salida(p[7], p[2])
+        )
+        self._avisar_caducidades_criticas(self._productos_cache)
         self._filtrar_productos()
 
     def _filtrar_productos(self):
@@ -726,14 +793,21 @@ class PuntoDeVenta(tk.Tk):
         for row in self.tabla_busq.get_children():
             self.tabla_busq.delete(row)
         for prod in self._productos_cache:
-            pid, codigo, nombre, precio, costo, stock, a_granel = prod
+            pid, codigo, nombre, precio, costo, stock, a_granel, caducidad = prod
             if q in codigo.lower() or q in nombre.lower():
-                tag = "low" if stock <= 5 else ""
+                es_critico, _dias = self._estado_caducidad(caducidad)
+                tags = []
+                if stock <= 5:
+                    tags.append("low")
+                if es_critico:
+                    tags.append("critical")
                 stock_txt = self._fmt_unidades(stock, bool(a_granel), bool(a_granel))
+                nombre_txt = f"⚠ {nombre}" if es_critico else nombre
                 self.tabla_busq.insert("", "end",
-                    values=(codigo, nombre, f"${precio:.2f}", stock_txt),
-                    iid=str(pid), tags=(tag,))
+                    values=(codigo, nombre_txt, f"${precio:.2f}", stock_txt),
+                    iid=str(pid), tags=tuple(tags))
         self.tabla_busq.tag_configure("low", foreground=C["yellow"])
+        self.tabla_busq.tag_configure("critical", foreground=C["red"])
 
     def _focus_tabla(self):
         children = self.tabla_busq.get_children()
@@ -757,7 +831,7 @@ class PuntoDeVenta(tk.Tk):
         prod = next((p for p in self._productos_cache if p[0] == pid), None)
         if not prod:
             return
-        pid, codigo, nombre, precio, costo, stock, a_granel = prod
+        pid, codigo, nombre, precio, costo, stock, a_granel, caducidad = prod
         es_granel = bool(a_granel)
         if stock <= 0:
             messagebox.showwarning("Sin stock",
@@ -780,7 +854,7 @@ class PuntoDeVenta(tk.Tk):
                 self.carrito.append({
                     "id": pid, "codigo": codigo, "nombre": nombre,
                     "precio": precio, "costo": costo, "cantidad": cantidad,
-                    "stock": stock, "es_granel": True
+                    "stock": stock, "es_granel": True, "caducidad": caducidad
                 })
             self._refresh_carrito()
             self.sv_busqueda.set("")
@@ -798,7 +872,8 @@ class PuntoDeVenta(tk.Tk):
                 return
         self.carrito.append({"id": pid, "codigo": codigo, "nombre": nombre,
                               "precio": precio, "costo": costo,
-                              "cantidad": 1, "stock": stock, "es_granel": False})
+                              "cantidad": 1, "stock": stock, "es_granel": False,
+                              "caducidad": caducidad})
         self._refresh_carrito()
         self.sv_busqueda.set("")
 
@@ -867,6 +942,153 @@ class PuntoDeVenta(tk.Tk):
         self._refresh_carrito()
         self._cargar_productos()
 
+    def _set_caducidad_form(self, valor):
+        fecha = (valor or "").strip()
+        if hasattr(self, "sv_caducidad"):
+            self.sv_caducidad.set(fecha)
+            return
+        if "e_caducidad" in getattr(self, "_prod_entries", {}):
+            ent = self._prod_entries["e_caducidad"]
+            ent.delete(0, "end")
+            ent.insert(0, fecha)
+
+    def _get_caducidad_form(self):
+        if hasattr(self, "sv_caducidad"):
+            return self.sv_caducidad.get().strip()
+        if "e_caducidad" in getattr(self, "_prod_entries", {}):
+            return self._prod_entries["e_caducidad"].get().strip()
+        return ""
+
+    def _set_prod_field(self, key, valor):
+        if key == "e_caducidad":
+            self._set_caducidad_form(str(valor))
+            return
+        ent = self._prod_entries[key]
+        ent.delete(0, "end")
+        ent.insert(0, str(valor))
+
+    def _clear_prod_form_inputs(self):
+        for key, ent in self._prod_entries.items():
+            if key == "e_caducidad":
+                self._set_caducidad_form("")
+            else:
+                ent.delete(0, "end")
+
+    def _abrir_selector_fecha(self):
+        if not hasattr(self, "sv_caducidad"):
+            return
+
+        hoy = datetime.date.today()
+        base = hoy
+        actual = self._get_caducidad_form()
+        if actual:
+            try:
+                base = datetime.date.fromisoformat(actual)
+            except ValueError:
+                pass
+
+        dlg = tk.Toplevel(self)
+        dlg.title("Seleccionar fecha de caducidad")
+        dlg.configure(bg=C["card"])
+        dlg.resizable(False, False)
+        dlg.transient(self)
+        dlg.grab_set()
+        dlg.focus_set()
+        self.update_idletasks()
+        x = self.winfo_x() + (self.winfo_width()  // 2) - 220
+        y = self.winfo_y() + (self.winfo_height() // 2) - 130
+        dlg.geometry(f"440x260+{x}+{y}")
+
+        tk.Label(dlg, text="FECHA DE CADUCIDAD", fg=C["accent2"], bg=C["card"],
+                 font=("Courier", 11, "bold")).pack(pady=(16, 6))
+        tk.Label(dlg, text="Selecciona año, mes y día.", fg=C["muted"], bg=C["card"],
+                 font=("Courier", 9)).pack()
+
+        frame = tk.Frame(dlg, bg=C["card"])
+        frame.pack(pady=14)
+
+        years = [str(y) for y in range(hoy.year - 5, hoy.year + 11)]
+        if str(base.year) not in years:
+            years.append(str(base.year))
+            years.sort()
+        months = [f"{m:02d}" for m in range(1, 13)]
+
+        sv_y = tk.StringVar(value=str(base.year))
+        sv_m = tk.StringVar(value=f"{base.month:02d}")
+        sv_d = tk.StringVar(value=f"{base.day:02d}")
+
+        def _dias_del_mes(anio, mes):
+            inicio = datetime.date(anio, mes, 1)
+            if mes == 12:
+                prox = datetime.date(anio + 1, 1, 1)
+            else:
+                prox = datetime.date(anio, mes + 1, 1)
+            return (prox - inicio).days
+
+        tk.Label(frame, text="Año", fg=C["muted"], bg=C["card"],
+                 font=("Courier", 9)).grid(row=0, column=0, padx=4, sticky="w")
+        tk.Label(frame, text="Mes", fg=C["muted"], bg=C["card"],
+                 font=("Courier", 9)).grid(row=0, column=1, padx=4, sticky="w")
+        tk.Label(frame, text="Día", fg=C["muted"], bg=C["card"],
+                 font=("Courier", 9)).grid(row=0, column=2, padx=4, sticky="w")
+
+        cb_y = ttk.Combobox(frame, textvariable=sv_y, values=years, state="readonly", width=8)
+        cb_m = ttk.Combobox(frame, textvariable=sv_m, values=months, state="readonly", width=6)
+        cb_d = ttk.Combobox(frame, textvariable=sv_d, state="readonly", width=6)
+        cb_y.grid(row=1, column=0, padx=4, ipady=2)
+        cb_m.grid(row=1, column=1, padx=4, ipady=2)
+        cb_d.grid(row=1, column=2, padx=4, ipady=2)
+
+        def _actualizar_dias(*_):
+            try:
+                anio = int(sv_y.get())
+                mes = int(sv_m.get())
+            except ValueError:
+                return
+            max_dia = _dias_del_mes(anio, mes)
+            dias = [f"{d:02d}" for d in range(1, max_dia + 1)]
+            cb_d.config(values=dias)
+            if sv_d.get() not in dias:
+                sv_d.set(dias[-1])
+
+        _actualizar_dias()
+        cb_y.bind("<<ComboboxSelected>>", _actualizar_dias)
+        cb_m.bind("<<ComboboxSelected>>", _actualizar_dias)
+
+        lbl_error = tk.Label(dlg, text="", fg=C["red"], bg=C["card"],
+                             font=("Courier", 9))
+        lbl_error.pack(pady=(2, 6))
+
+        def _aceptar():
+            try:
+                fecha = datetime.date(int(sv_y.get()), int(sv_m.get()), int(sv_d.get()))
+            except ValueError:
+                lbl_error.config(text="Fecha inválida.")
+                return
+            self._set_caducidad_form(fecha.isoformat())
+            dlg.destroy()
+
+        def _limpiar():
+            self._set_caducidad_form("")
+            dlg.destroy()
+
+        btns = tk.Frame(dlg, bg=C["card"])
+        btns.pack(fill="x", padx=18, pady=(2, 12))
+        tk.Button(btns, text="🗑 Limpiar fecha", bg=C["panel"], fg=C["muted"], bd=0,
+                  font=("Courier", 10), pady=8, cursor="hand2",
+                  command=_limpiar).pack(side="left", padx=(0, 4))
+        tk.Button(btns, text="✕ Cancelar", bg=C["panel"], fg=C["muted"], bd=0,
+                  font=("Courier", 10), pady=8, cursor="hand2",
+                  command=dlg.destroy).pack(side="right", padx=(4, 0))
+        tk.Button(btns, text="✔ Aceptar", bg=C["green"], fg=C["white"], bd=0,
+                  font=("Courier", 10, "bold"), pady=8, cursor="hand2",
+                  activebackground="#27ae60",
+                  command=_aceptar).pack(side="right")
+
+        dlg.bind("<Return>", lambda e: _aceptar())
+        dlg.bind("<Escape>", lambda e: dlg.destroy())
+        dlg.protocol("WM_DELETE_WINDOW", dlg.destroy)
+
     # ══════════════════════════════════════════════════════
     #  PÁGINA: PRODUCTOS
     # ══════════════════════════════════════════════════════
@@ -879,11 +1101,12 @@ class PuntoDeVenta(tk.Tk):
 
         tk.Label(form_card, text="AGREGAR / EDITAR PRODUCTO",
                  fg=C["muted"], bg=C["card"], font=("Courier", 9, "bold")).grid(
-                     row=0, column=0, columnspan=6, sticky="w", pady=(0,10))
+                     row=0, column=0, columnspan=7, sticky="w", pady=(0,10))
 
         fields = [("Código", "e_codigo"), ("Nombre", "e_nombre"),
                   ("Costo $", "e_costo"), ("Precio venta $", "e_precio"),
-                  ("Stock", "e_stock"), ("Categoría", "e_categoria")]
+                  ("Stock", "e_stock"), ("Categoría", "e_categoria"),
+                  ("Caducidad (YYYY-MM-DD)", "e_caducidad")]
         entry_widths = {
             "e_codigo": 12,
             "e_nombre": 30,
@@ -891,8 +1114,10 @@ class PuntoDeVenta(tk.Tk):
             "e_precio": 10,
             "e_stock": 7,
             "e_categoria": 16,
+            "e_caducidad": 14,
         }
         self._prod_entries = {}
+        self.sv_caducidad = tk.StringVar(value="")
         for col, (lbl, key) in enumerate(fields):
             color_lbl = C["yellow"] if key == "e_costo" else C["muted"]
             tk.Label(form_card, text=lbl, fg=color_lbl, bg=C["card"],
@@ -910,6 +1135,27 @@ class PuntoDeVenta(tk.Tk):
                           bd=0, font=("Courier", 10), padx=5, cursor="hand2",
                           activebackground="#6a4aaf",
                           command=self._limpiar_form_producto).pack(side="left", padx=(2,0))
+            elif key == "e_caducidad":
+                wrap = tk.Frame(form_card, bg=C["card"])
+                wrap.grid(row=2, column=col, padx=(0,8), sticky="ew")
+                ent = tk.Entry(
+                    wrap,
+                    textvariable=self.sv_caducidad,
+                    bg=C["panel"], fg=C["text"],
+                    readonlybackground=C["panel"],
+                    insertbackground=C["text"],
+                    bd=0, font=("Courier", 11),
+                    highlightbackground=C["border"], highlightthickness=1,
+                    width=entry_widths[key], state="readonly", cursor="hand2"
+                )
+                ent.pack(side="left", fill="x", expand=True, ipady=6)
+                ent.bind("<Button-1>", lambda e: (self._abrir_selector_fecha(), "break")[1])
+                tk.Button(
+                    wrap, text="📅", bg=C["accent2"], fg=C["white"], bd=0,
+                    font=("Courier", 10), padx=5, cursor="hand2",
+                    activebackground="#6a4aaf",
+                    command=self._abrir_selector_fecha
+                ).pack(side="left", padx=(2,0))
             else:
                 ent = tk.Entry(form_card, bg=C["panel"], fg=C["text"],
                                insertbackground=C["text"], bd=0, font=("Courier", 11),
@@ -924,6 +1170,7 @@ class PuntoDeVenta(tk.Tk):
         form_card.columnconfigure(3, weight=2, minsize=110)   # Precio
         form_card.columnconfigure(4, weight=1, minsize=85)    # Stock
         form_card.columnconfigure(5, weight=3, minsize=160)   # Categoría
+        form_card.columnconfigure(6, weight=2, minsize=150)   # Caducidad
         self.sv_es_granel = tk.BooleanVar(value=False)
         tk.Checkbutton(
             form_card,
@@ -939,10 +1186,10 @@ class PuntoDeVenta(tk.Tk):
             font=("Courier", 9),
             highlightthickness=0,
             bd=0
-        ).grid(row=3, column=0, columnspan=6, sticky="w", pady=(10, 0))
+        ).grid(row=3, column=0, columnspan=7, sticky="w", pady=(10, 0))
 
         btn_frame = tk.Frame(form_card, bg=C["card"])
-        btn_frame.grid(row=4, column=0, columnspan=6, pady=(10,0), sticky="e")
+        btn_frame.grid(row=4, column=0, columnspan=7, pady=(10,0), sticky="e")
         tk.Button(btn_frame, text="● Producto nuevo", bg=C["accent2"], fg=C["white"],
               bd=0, font=("Courier", 10), padx=12, pady=6, cursor="hand2",
               activebackground="#6a4aaf",
@@ -959,9 +1206,9 @@ class PuntoDeVenta(tk.Tk):
               activebackground="#1a4a10",
               command=self._exportar_inventario_docx).pack(side="left")
 
-        cols = ("id","codigo","nombre","costo","precio","stock","categoria","granel")
-        heads = ("ID","Código","Nombre","Costo","Precio venta","Stock","Categoría","A granel")
-        widths = [40,80,190,70,80,70,90,75]
+        cols = ("id","codigo","nombre","costo","precio","stock","categoria","caducidad","granel","estado")
+        heads = ("ID","Código","Nombre","Costo","Precio venta","Stock","Categoría","Caducidad","A granel","Estado")
+        widths = [40,75,180,70,80,70,90,120,70,110]
 
         frame_t = tk.Frame(page, bg=C["bg"])
         frame_t.pack(fill="both", expand=True)
@@ -1004,33 +1251,45 @@ class PuntoDeVenta(tk.Tk):
             self.tabla_prod.delete(row)
         with get_conn() as conn:
             rows = conn.execute(
-                "SELECT id,codigo,nombre,costo,precio,stock,categoria,a_granel"
+                "SELECT id,codigo,nombre,costo,precio,stock,categoria,a_granel,caducidad"
                 " FROM productos ORDER BY nombre"
             ).fetchall()
+        rows = sorted(rows, key=lambda r: self._clave_prioridad_salida(r[8], r[2]))
         for r in rows:
             if q in r[1].lower() or q in r[2].lower():
-                tag = "low" if r[5] <= 5 else ""
+                es_critico, dias = self._estado_caducidad(r[8])
+                tags = []
+                if r[5] <= 5:
+                    tags.append("low")
+                if es_critico:
+                    tags.append("critical")
                 stock_txt = self._fmt_unidades(r[5], bool(r[7]), bool(r[7]))
+                estado = self._texto_estado_caducidad(dias)
+                nombre_txt = f"⚠ {r[2]}" if es_critico else r[2]
                 self.tabla_prod.insert("", "end",
-                    values=(r[0],r[1],r[2],f"${r[3]:.2f}",f"${r[4]:.2f}",stock_txt,r[6],
-                            "Sí" if r[7] else "No"),
-                    iid=str(r[0]), tags=(tag,))
+                    values=(
+                        r[0], r[1], nombre_txt, f"${r[3]:.2f}", f"${r[4]:.2f}",
+                        stock_txt, r[6], r[8] or "-", "Sí" if r[7] else "No", estado
+                    ),
+                    iid=str(r[0]), tags=tuple(tags))
         self.tabla_prod.tag_configure("low", foreground=C["yellow"])
+        self.tabla_prod.tag_configure("critical", foreground=C["red"])
 
     def _llenar_form_producto(self, event=None):
         sel = self.tabla_prod.selection()
         if not sel:
             return
         vals = self.tabla_prod.item(sel[0], "values")
-        pid, codigo, nombre, costo, precio, stock, cat, granel = vals
+        pid, codigo, nombre, costo, precio, stock, cat, caducidad, granel, _estado = vals
+        nombre = str(nombre).replace("⚠", "").strip()
         costo = costo.replace("$","")
         precio = precio.replace("$","")
         stock = str(stock).replace("kg", "").replace("KG", "").strip()
-        keys = ("e_codigo","e_nombre","e_costo","e_precio","e_stock","e_categoria")
-        datos = (codigo, nombre, costo, precio, stock, cat)
+        caducidad = "" if caducidad == "-" else caducidad
+        keys = ("e_codigo","e_nombre","e_costo","e_precio","e_stock","e_categoria","e_caducidad")
+        datos = (codigo, nombre, costo, precio, stock, cat, caducidad)
         for k,d in zip(keys, datos):
-            self._prod_entries[k].delete(0,"end")
-            self._prod_entries[k].insert(0, d)
+            self._set_prod_field(k, d)
         self.sv_es_granel.set(str(granel).strip().lower() in ("sí", "si", "1", "true"))
         self._editing_id = int(pid)
 
@@ -1042,6 +1301,7 @@ class PuntoDeVenta(tk.Tk):
             precio   = float(self._prod_entries["e_precio"].get().strip().replace(",", "."))
             stock_txt = self._prod_entries["e_stock"].get().strip()
             categoria= self._prod_entries["e_categoria"].get().strip() or "General"
+            caducidad_txt = self._get_caducidad_form()
         except ValueError:
             messagebox.showerror("Error",
                 "Costo y Precio deben ser números válidos.",
@@ -1060,6 +1320,17 @@ class PuntoDeVenta(tk.Tk):
                 parent=self
             )
             return
+        caducidad = None
+        if caducidad_txt:
+            try:
+                caducidad = datetime.date.fromisoformat(caducidad_txt).isoformat()
+            except ValueError:
+                messagebox.showerror(
+                    "Error",
+                    "La fecha de caducidad debe tener formato YYYY-MM-DD.",
+                    parent=self
+                )
+                return
         if not codigo or not nombre:
             messagebox.showerror("Error", "Código y Nombre son obligatorios.", parent=self)
             return
@@ -1071,24 +1342,23 @@ class PuntoDeVenta(tk.Tk):
         with get_conn() as conn:
             if eid:
                 conn.execute(
-                    "UPDATE productos SET codigo=?,nombre=?,costo=?,precio=?,stock=?,categoria=?,a_granel=?"
+                    "UPDATE productos SET codigo=?,nombre=?,costo=?,precio=?,stock=?,categoria=?,a_granel=?,caducidad=?"
                     " WHERE id=?",
-                    (codigo, nombre, costo, precio, stock, categoria, int(es_granel), eid))
+                    (codigo, nombre, costo, precio, stock, categoria, int(es_granel), caducidad, eid))
                 msg = "Producto actualizado."
             else:
                 try:
                     conn.execute(
-                        "INSERT INTO productos (codigo,nombre,costo,precio,stock,categoria,a_granel)"
-                        " VALUES (?,?,?,?,?,?,?)",
-                        (codigo, nombre, costo, precio, stock, categoria, int(es_granel)))
+                        "INSERT INTO productos (codigo,nombre,costo,precio,stock,categoria,a_granel,caducidad)"
+                        " VALUES (?,?,?,?,?,?,?,?)",
+                        (codigo, nombre, costo, precio, stock, categoria, int(es_granel), caducidad))
                     msg = "Producto agregado."
                 except sqlite3.IntegrityError:
                     messagebox.showerror("Error",
                         f'El código "{codigo}" ya existe.', parent=self)
                     return
         messagebox.showinfo("OK", msg, parent=self)
-        for e in self._prod_entries.values():
-            e.delete(0,"end")
+        self._clear_prod_form_inputs()
         self.sv_es_granel.set(False)
         self._editing_id = None
         self._autocodigo()
@@ -1107,8 +1377,7 @@ class PuntoDeVenta(tk.Tk):
             f'¿Eliminar "{nombre}"? (No se puede deshacer)', parent=self):
             with get_conn() as conn:
                 conn.execute("DELETE FROM productos WHERE id=?", (eid,))
-            for e in self._prod_entries.values():
-                e.delete(0,"end")
+            self._clear_prod_form_inputs()
             self._editing_id = None
             self._autocodigo()
             self._cargar_tabla_productos()
@@ -1123,15 +1392,13 @@ class PuntoDeVenta(tk.Tk):
         e.insert(0, codigo)
 
     def _limpiar_form_producto(self):
-        for k, ent in self._prod_entries.items():
-            ent.delete(0, "end")
+        self._clear_prod_form_inputs()
         self.sv_es_granel.set(False)
         self._editing_id = None
 
     def _nuevo_producto(self):
         self._editing_id = None
-        for ent in self._prod_entries.values():
-            ent.delete(0, "end")
+        self._clear_prod_form_inputs()
         self.sv_es_granel.set(False)
         self._autocodigo()
         if "e_nombre" in self._prod_entries:
