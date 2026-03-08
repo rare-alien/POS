@@ -7,7 +7,7 @@
 
 import tkinter as tk
 from tkinter import ttk, messagebox, font as tkfont
-import sqlite3, os, datetime, hashlib, csv
+import sqlite3, os, datetime, hashlib, csv, unicodedata
 
 # ── python-docx (inventario físico) — opcional ────────────
 try:
@@ -67,6 +67,11 @@ def init_db():
                 categoria TEXT    DEFAULT 'General',
                 a_granel  INTEGER NOT NULL DEFAULT 0,
                 caducidad TEXT    DEFAULT NULL
+            );
+
+            CREATE TABLE IF NOT EXISTS categorias_productos (
+                id      INTEGER PRIMARY KEY AUTOINCREMENT,
+                nombre  TEXT UNIQUE COLLATE NOCASE NOT NULL
             );
 
             CREATE TABLE IF NOT EXISTS ventas (
@@ -197,6 +202,14 @@ def init_db():
                     ("P005", "Café americano",   25.0, 14.0, 20, "Cafetería"),
                 ]
             )
+        conn.execute(
+            "INSERT OR IGNORE INTO categorias_productos (nombre) VALUES ('General')"
+        )
+        conn.execute(
+            "INSERT OR IGNORE INTO categorias_productos (nombre)"
+            " SELECT DISTINCT TRIM(categoria) FROM productos"
+            " WHERE categoria IS NOT NULL AND TRIM(categoria) <> ''"
+        )
 
 def _generar_codigo_unico():
     with get_conn() as conn:
@@ -479,6 +492,7 @@ class PuntoDeVenta(tk.Tk):
         self._clientes_cache = []
         self._cliente_id_por_opcion = {"Público general": None}
         self._categorias_contables_cache = []
+        self._categorias_producto_cache = []
         self._build_ui()
         self._cargar_productos()
         self._cargar_clientes_en_venta()
@@ -535,6 +549,7 @@ class PuntoDeVenta(tk.Tk):
 
     def _show_ventas(self):    self._show_page("ventas")
     def _show_productos(self):
+        self._refrescar_categorias_producto()
         self._cargar_tabla_productos()
         self._show_page("productos")
         if not getattr(self, "_editing_id", None):
@@ -633,12 +648,39 @@ class PuntoDeVenta(tk.Tk):
         cliente_f.pack(fill="x", pady=(8, 4))
         tk.Label(cliente_f, text="Cliente (opcional)", fg=C["muted"], bg=C["panel"],
                  font=("Courier", 9)).pack(anchor="w")
+        tk.Label(cliente_f, text="Buscar cliente", fg=C["muted"], bg=C["panel"],
+                 font=("Courier", 9)).pack(anchor="w", pady=(4, 0))
+        self.sv_cliente_busqueda_venta = tk.StringVar(value="")
+        self.sv_cliente_busqueda_venta.trace_add(
+            "write", lambda *a: self._filtrar_clientes_en_venta()
+        )
+        tk.Entry(
+            cliente_f,
+            textvariable=self.sv_cliente_busqueda_venta,
+            bg=C["card"], fg=C["text"], insertbackground=C["text"],
+            bd=0, font=("Courier", 10), highlightthickness=1,
+            highlightbackground=C["border"]
+        ).pack(fill="x", ipady=4, pady=(2, 4))
+        self.frame_lista_clientes_venta = tk.Frame(cliente_f, bg=C["panel"])
+        self.lst_clientes_venta = tk.Listbox(
+            self.frame_lista_clientes_venta,
+            bg=C["card"], fg=C["text"], selectbackground=C["accent2"],
+            bd=0, font=("Courier", 9), activestyle="none",
+            highlightthickness=1, highlightbackground=C["border"], height=4
+        )
+        self.lst_clientes_venta.pack(fill="x")
+        self.lst_clientes_venta.bind("<<ListboxSelect>>", self._seleccionar_cliente_lista_venta)
+        self.lst_clientes_venta.bind("<Return>", self._seleccionar_cliente_lista_venta)
+        self.frame_lista_clientes_venta.pack_forget()
         self.sv_cliente_venta = tk.StringVar(value="Público general")
         self.cmb_cliente_venta = ttk.Combobox(
             cliente_f,
             textvariable=self.sv_cliente_venta,
             state="readonly",
             font=("Courier", 10)
+        )
+        self.cmb_cliente_venta.bind(
+            "<<ComboboxSelected>>", lambda _e: self.sv_cliente_busqueda_venta.set("")
         )
         self.cmb_cliente_venta.pack(fill="x", ipady=4, pady=(2, 0))
         self.cmb_cliente_venta["values"] = ("Público general",)
@@ -702,6 +744,11 @@ class PuntoDeVenta(tk.Tk):
             return f"{txt} kg" if con_unidad else txt
         return str(int(round(num)))
 
+    def _texto_busqueda(self, texto):
+        base = (texto or "").strip().lower()
+        nfkd = unicodedata.normalize("NFD", base)
+        return "".join(c for c in nfkd if unicodedata.category(c) != "Mn")
+
     def _estado_caducidad(self, fecha_txt):
         fecha_txt = (fecha_txt or "").strip()
         if not fecha_txt:
@@ -733,7 +780,7 @@ class PuntoDeVenta(tk.Tk):
     def _avisar_caducidades_criticas(self, productos):
         criticos_nuevos = []
         for prod in productos:
-            pid, codigo, nombre, _precio, _costo, _stock, _a_granel, caducidad = prod
+            pid, codigo, nombre, _precio, _costo, _stock, _a_granel, caducidad, *_extra = prod
             es_critico, dias = self._estado_caducidad(caducidad)
             if not es_critico:
                 continue
@@ -889,7 +936,7 @@ class PuntoDeVenta(tk.Tk):
         self._productos_cache = []
         with get_conn() as conn:
             rows = conn.execute(
-                "SELECT id,codigo,nombre,precio,costo,stock,a_granel,caducidad"
+                "SELECT id,codigo,nombre,precio,costo,stock,a_granel,caducidad,categoria"
                 " FROM productos ORDER BY nombre"
             ).fetchall()
         self._productos_cache = sorted(
@@ -900,12 +947,15 @@ class PuntoDeVenta(tk.Tk):
         self._filtrar_productos()
 
     def _filtrar_productos(self):
-        q = self.sv_busqueda.get().strip().lower()
+        q = self._texto_busqueda(self.sv_busqueda.get())
         for row in self.tabla_busq.get_children():
             self.tabla_busq.delete(row)
         for prod in self._productos_cache:
-            pid, codigo, nombre, precio, costo, stock, a_granel, caducidad = prod
-            if q in codigo.lower() or q in nombre.lower():
+            pid, codigo, nombre, precio, costo, stock, a_granel, caducidad, categoria = prod
+            codigo_q = self._texto_busqueda(codigo)
+            nombre_q = self._texto_busqueda(nombre)
+            categoria_q = self._texto_busqueda(categoria)
+            if q in codigo_q or q in nombre_q or q in categoria_q:
                 es_critico, _dias = self._estado_caducidad(caducidad)
                 tags = []
                 if stock <= 5:
@@ -942,7 +992,7 @@ class PuntoDeVenta(tk.Tk):
         prod = next((p for p in self._productos_cache if p[0] == pid), None)
         if not prod:
             return
-        pid, codigo, nombre, precio, costo, stock, a_granel, caducidad = prod
+        pid, codigo, nombre, precio, costo, stock, a_granel, caducidad, _categoria = prod
         es_granel = bool(a_granel)
         if stock <= 0:
             messagebox.showwarning("Sin stock",
@@ -1158,11 +1208,58 @@ class PuntoDeVenta(tk.Tk):
             self._cliente_id_por_opcion[etiqueta] = cid
             opciones.append(etiqueta)
 
+        self._cliente_opciones_venta = list(opciones)
         self.cmb_cliente_venta["values"] = tuple(opciones)
         if actual in opciones:
             self.sv_cliente_venta.set(actual)
         else:
             self.sv_cliente_venta.set("Público general")
+        self._filtrar_clientes_en_venta()
+
+    def _filtrar_clientes_en_venta(self):
+        if not hasattr(self, "cmb_cliente_venta"):
+            return
+        opciones_base = list(getattr(self, "_cliente_opciones_venta", ["Público general"]))
+        if not opciones_base:
+            opciones_base = ["Público general"]
+
+        q = ""
+        if hasattr(self, "sv_cliente_busqueda_venta"):
+            q = self._texto_busqueda(self.sv_cliente_busqueda_venta.get())
+
+        actual = self.sv_cliente_venta.get().strip() if hasattr(self, "sv_cliente_venta") else ""
+        if actual not in self._cliente_id_por_opcion:
+            self.sv_cliente_venta.set("Público general")
+
+        if not hasattr(self, "lst_clientes_venta") or not hasattr(self, "frame_lista_clientes_venta"):
+            return
+
+        self.lst_clientes_venta.delete(0, "end")
+        if not q:
+            self.frame_lista_clientes_venta.pack_forget()
+            return
+
+        filtradas = [op for op in opciones_base if q in self._texto_busqueda(op)]
+        if not filtradas:
+            filtradas = ["Sin coincidencias"]
+
+        for op in filtradas:
+            self.lst_clientes_venta.insert("end", op)
+        self.lst_clientes_venta.config(height=min(max(len(filtradas), 1), 6))
+        self.frame_lista_clientes_venta.pack(fill="x", pady=(0, 4))
+
+    def _seleccionar_cliente_lista_venta(self, event=None):
+        if not hasattr(self, "lst_clientes_venta"):
+            return
+        sel = self.lst_clientes_venta.curselection()
+        if not sel:
+            return
+        etiqueta = self.lst_clientes_venta.get(sel[0])
+        if etiqueta not in self._cliente_id_por_opcion:
+            return
+        self.sv_cliente_venta.set(etiqueta)
+        if hasattr(self, "sv_cliente_busqueda_venta"):
+            self.sv_cliente_busqueda_venta.set("")
 
     # ── Contabilidad (núcleo) ─────────────────────────────
     def _cargar_categorias_contables_cache(self):
@@ -1589,6 +1686,107 @@ class PuntoDeVenta(tk.Tk):
             return self._prod_entries["e_caducidad"].get().strip()
         return ""
 
+    def _normalizar_categoria_producto(self, texto):
+        return " ".join((texto or "").strip().split())
+
+    def _cargar_categorias_producto_cache(self):
+        categorias = set()
+        with get_conn() as conn:
+            rows_catalogo = conn.execute(
+                "SELECT nombre FROM categorias_productos ORDER BY nombre COLLATE NOCASE"
+            ).fetchall()
+            rows_productos = conn.execute(
+                "SELECT DISTINCT categoria FROM productos"
+                " WHERE categoria IS NOT NULL AND TRIM(categoria) <> ''"
+            ).fetchall()
+        for (nombre,) in rows_catalogo + rows_productos:
+            cat = self._normalizar_categoria_producto(nombre)
+            if cat:
+                categorias.add(cat)
+        if "General" not in categorias:
+            categorias.add("General")
+        self._categorias_producto_cache = sorted(categorias, key=str.casefold)
+
+    def _actualizar_combo_categoria_producto(self, filtro=None, abrir=False):
+        if not hasattr(self, "cmb_categoria_producto"):
+            return
+        termino = self._normalizar_categoria_producto(
+            self.sv_categoria_producto.get() if filtro is None else filtro
+        )
+        if termino:
+            fold = termino.casefold()
+            opciones = [c for c in self._categorias_producto_cache if fold in c.casefold()]
+        else:
+            opciones = list(self._categorias_producto_cache)
+        self.cmb_categoria_producto["values"] = tuple(opciones)
+        if abrir and opciones:
+            self.after_idle(lambda: self.cmb_categoria_producto.event_generate("<Down>"))
+
+    def _refrescar_categorias_producto(self, filtro=None):
+        self._cargar_categorias_producto_cache()
+        self._actualizar_combo_categoria_producto(filtro=filtro)
+
+    def _on_categoria_producto_keyrelease(self, event=None):
+        if event and event.keysym in {
+            "Up", "Down", "Left", "Right", "Home", "End", "Prior", "Next",
+            "Return", "Escape", "Tab", "Shift_L", "Shift_R", "Control_L",
+            "Control_R", "Alt_L", "Alt_R"
+        }:
+            return
+        self._actualizar_combo_categoria_producto(abrir=True)
+
+    def _registrar_categoria_producto(self, categoria):
+        nombre = self._normalizar_categoria_producto(categoria) or "General"
+        with get_conn() as conn:
+            row = conn.execute(
+                "SELECT nombre FROM categorias_productos WHERE LOWER(nombre)=LOWER(?)",
+                (nombre,)
+            ).fetchone()
+            if row:
+                return row[0]
+            conn.execute(
+                "INSERT INTO categorias_productos (nombre) VALUES (?)",
+                (nombre,)
+            )
+        return nombre
+
+    def _crear_categoria_producto(self):
+        nombre = self._normalizar_categoria_producto(self.sv_categoria_producto.get())
+        if not nombre:
+            messagebox.showwarning(
+                "Categoría vacía",
+                "Escribe un nombre de categoría para crearla.",
+                parent=self
+            )
+            return
+        with get_conn() as conn:
+            row = conn.execute(
+                "SELECT nombre FROM categorias_productos WHERE LOWER(nombre)=LOWER(?)",
+                (nombre,)
+            ).fetchone()
+            if row:
+                final = row[0]
+            else:
+                conn.execute(
+                    "INSERT INTO categorias_productos (nombre) VALUES (?)",
+                    (nombre,)
+                )
+                final = nombre
+        self.sv_categoria_producto.set(final)
+        self._refrescar_categorias_producto(filtro=final)
+        if row:
+            messagebox.showinfo(
+                "Categoría existente",
+                f'La categoría "{final}" ya estaba registrada.',
+                parent=self
+            )
+        else:
+            messagebox.showinfo(
+                "Categoría creada",
+                f'Se agregó la categoría "{final}".',
+                parent=self
+            )
+
     def _set_prod_field(self, key, valor):
         if key == "e_caducidad":
             self._set_caducidad_form(str(valor))
@@ -1748,6 +1946,8 @@ class PuntoDeVenta(tk.Tk):
         }
         self._prod_entries = {}
         self.sv_caducidad = tk.StringVar(value="")
+        self.sv_categoria_producto = tk.StringVar(value="")
+        self._refrescar_categorias_producto()
         for col, (lbl, key) in enumerate(fields):
             color_lbl = C["yellow"] if key == "e_costo" else C["muted"]
             tk.Label(form_card, text=lbl, fg=color_lbl, bg=C["card"],
@@ -1779,12 +1979,33 @@ class PuntoDeVenta(tk.Tk):
                     width=entry_widths[key], state="readonly", cursor="hand2"
                 )
                 ent.pack(side="left", fill="x", expand=True, ipady=6)
-                ent.bind("<Button-1>", lambda e: (self._abrir_selector_fecha(), "break")[1])
                 tk.Button(
                     wrap, text="📅", bg=C["accent2"], fg=C["white"], bd=0,
                     font=("Courier", 10), padx=5, cursor="hand2",
                     activebackground="#6a4aaf",
                     command=self._abrir_selector_fecha
+                ).pack(side="left", padx=(2,0))
+            elif key == "e_categoria":
+                wrap = tk.Frame(form_card, bg=C["card"])
+                wrap.grid(row=2, column=col, padx=(0,8), sticky="ew")
+                ent = ttk.Combobox(
+                    wrap,
+                    textvariable=self.sv_categoria_producto,
+                    state="normal",
+                    values=tuple(self._categorias_producto_cache),
+                    width=entry_widths[key],
+                    font=("Courier", 10)
+                )
+                ent.pack(side="left", fill="x", expand=True, ipady=3)
+                ent.bind("<KeyRelease>", self._on_categoria_producto_keyrelease)
+                ent.bind("<FocusIn>", lambda _e: self._actualizar_combo_categoria_producto())
+                ent.bind("<<ComboboxSelected>>", lambda _e: self._actualizar_combo_categoria_producto())
+                self.cmb_categoria_producto = ent
+                tk.Button(
+                    wrap, text="＋", bg=C["accent2"], fg=C["white"], bd=0,
+                    font=("Courier", 10), padx=5, cursor="hand2",
+                    activebackground="#6a4aaf",
+                    command=self._crear_categoria_producto
                 ).pack(side="left", padx=(2,0))
             else:
                 ent = tk.Entry(form_card, bg=C["panel"], fg=C["text"],
@@ -1864,7 +2085,9 @@ class PuntoDeVenta(tk.Tk):
         tk.Entry(search_f, textvariable=self.sv_prod_filter,
                  bg=C["panel"], fg=C["text"], insertbackground=C["text"],
                  bd=0, font=("Courier",10), highlightthickness=1,
-                 highlightbackground=C["border"], width=30).pack(side="left", ipady=5)
+                 highlightbackground=C["border"]).pack(
+                     side="left", fill="x", expand=True, padx=(6,0), ipady=5
+                 )
 
         search_f.pack_forget()
         form_card.pack_forget()
@@ -1876,7 +2099,7 @@ class PuntoDeVenta(tk.Tk):
     def _cargar_tabla_productos(self):
         q = ""
         if hasattr(self, "sv_prod_filter"):
-            q = self.sv_prod_filter.get().strip().lower()
+            q = self._texto_busqueda(self.sv_prod_filter.get())
         for row in self.tabla_prod.get_children():
             self.tabla_prod.delete(row)
         with get_conn() as conn:
@@ -1886,7 +2109,10 @@ class PuntoDeVenta(tk.Tk):
             ).fetchall()
         rows = sorted(rows, key=lambda r: self._clave_prioridad_salida(r[8], r[2]))
         for r in rows:
-            if q in r[1].lower() or q in r[2].lower():
+            codigo_q = self._texto_busqueda(r[1])
+            nombre_q = self._texto_busqueda(r[2])
+            categoria_q = self._texto_busqueda(r[6])
+            if q in codigo_q or q in nombre_q or q in categoria_q:
                 es_critico, dias = self._estado_caducidad(r[8])
                 tags = []
                 if r[5] <= 5:
@@ -1930,7 +2156,9 @@ class PuntoDeVenta(tk.Tk):
             costo    = float((self._prod_entries["e_costo"].get().strip() or "0").replace(",", "."))
             precio   = float(self._prod_entries["e_precio"].get().strip().replace(",", "."))
             stock_txt = self._prod_entries["e_stock"].get().strip()
-            categoria= self._prod_entries["e_categoria"].get().strip() or "General"
+            categoria = self._normalizar_categoria_producto(
+                self._prod_entries["e_categoria"].get()
+            ) or "General"
             caducidad_txt = self._get_caducidad_form()
         except ValueError:
             messagebox.showerror("Error",
@@ -1967,6 +2195,8 @@ class PuntoDeVenta(tk.Tk):
         if costo < 0 or precio < 0 or stock < 0:
             messagebox.showerror("Error", "Costo, Precio y Stock no pueden ser negativos.", parent=self)
             return
+        categoria = self._registrar_categoria_producto(categoria)
+        self.sv_categoria_producto.set(categoria)
 
         eid = getattr(self, "_editing_id", None)
         with get_conn() as conn:
@@ -1992,6 +2222,7 @@ class PuntoDeVenta(tk.Tk):
         self.sv_es_granel.set(False)
         self._editing_id = None
         self._autocodigo()
+        self._refrescar_categorias_producto()
         self._cargar_tabla_productos()
         self._cargar_productos()
 
