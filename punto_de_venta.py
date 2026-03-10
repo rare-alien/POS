@@ -3211,12 +3211,14 @@ class PuntoDeVenta(tk.Tk):
                     " ORDER BY v.id DESC LIMIT 200"
                 ).fetchall()
             kpi = conn.execute(
-                "SELECT COUNT(*), IFNULL(SUM(v.total),0),"
-                " IFNULL(SUM(dv.ganancia),0)"
-                " FROM ventas v"
-                " LEFT JOIN detalle_venta dv ON dv.venta_id = v.id"
-                " WHERE v.fecha LIKE ?",
-                (f"{today}%",)).fetchone()
+                "SELECT"
+                " (SELECT COUNT(*) FROM ventas WHERE fecha LIKE ?),"
+                " (SELECT IFNULL(SUM(total),0) FROM ventas WHERE fecha LIKE ?),"
+                " (SELECT IFNULL(SUM(dv.ganancia),0)"
+                "    FROM detalle_venta dv"
+                "    INNER JOIN ventas v ON v.id = dv.venta_id"
+                "   WHERE v.fecha LIKE ?)",
+                (f"{today}%", f"{today}%", f"{today}%")).fetchone()
         for r in rows:
             self.tabla_hist.insert("","end",
                 values=(r[0],r[1],r[2],f"${r[3]:.2f}"), iid=str(r[0]))
@@ -3260,13 +3262,23 @@ class PuntoDeVenta(tk.Tk):
                     ORDER BY v.id DESC
                 """)
                 filas = cursor.fetchall()
+            filas_csv = []
+            venta_ids_exportadas = set()
+            for fila in filas:
+                fila = list(fila)
+                venta_id = fila[0]
+                if venta_id in venta_ids_exportadas:
+                    fila[3] = ""
+                else:
+                    venta_ids_exportadas.add(venta_id)
+                filas_csv.append(fila)
             with open(ruta_completa, mode="w", newline="", encoding="utf-8") as archivo_csv:
                 escritor = csv.writer(archivo_csv)
                 escritor.writerow([
                     "ID_Venta", "Fecha_Venta", "Cliente", "Total_Venta",
                     "Producto", "Cantidad", "Precio_Unitario", "Subtotal_Producto", "Ganancia_Producto"
                 ])
-                escritor.writerows(filas)
+                escritor.writerows(filas_csv)
             messagebox.showinfo(
                 "✔ Exportación exitosa",
                 f"El historial se ha exportado correctamente.\n\nArchivo guardado en:\n{ruta_completa}",
