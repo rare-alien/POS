@@ -50,7 +50,8 @@ def set_admin_hash(nuevo_hash):
         )
 
 def init_db():
-    with get_conn() as conn:
+    conn = get_conn()
+    try:
         conn.executescript("""
             CREATE TABLE IF NOT EXISTS configuracion (
                 clave  TEXT PRIMARY KEY,
@@ -67,6 +68,32 @@ def init_db():
                 categoria TEXT    DEFAULT 'General',
                 a_granel  INTEGER NOT NULL DEFAULT 0,
                 caducidad TEXT    DEFAULT NULL
+            );
+
+            CREATE TABLE IF NOT EXISTS lotes_inventario (
+                id                  INTEGER PRIMARY KEY AUTOINCREMENT,
+                producto_id         INTEGER NOT NULL,
+                fecha_ingreso       TEXT    NOT NULL,
+                costo_unitario      REAL    NOT NULL DEFAULT 0,
+                cantidad_inicial    REAL    NOT NULL DEFAULT 0,
+                cantidad_disponible REAL    NOT NULL DEFAULT 0,
+                FOREIGN KEY (producto_id) REFERENCES productos(id)
+            );
+
+            CREATE TABLE IF NOT EXISTS movimientos_inventario (
+                id             INTEGER PRIMARY KEY AUTOINCREMENT,
+                fecha          TEXT    NOT NULL DEFAULT (datetime('now','localtime')),
+                producto_id    INTEGER NOT NULL,
+                tipo           TEXT    NOT NULL CHECK (tipo IN ('ENTRADA','SALIDA')),
+                cantidad       REAL    NOT NULL DEFAULT 0,
+                precio_venta   REAL    NOT NULL DEFAULT 0,
+                costo_unitario REAL    NOT NULL DEFAULT 0,
+                costo_total    REAL    NOT NULL DEFAULT 0,
+                stock_anterior REAL    NOT NULL DEFAULT 0,
+                stock_posterior REAL   NOT NULL DEFAULT 0,
+                motivo         TEXT    NOT NULL DEFAULT '',
+                referencia     TEXT    DEFAULT '',
+                FOREIGN KEY (producto_id) REFERENCES productos(id)
             );
 
             CREATE TABLE IF NOT EXISTS categorias_productos (
@@ -147,6 +174,12 @@ def init_db():
                 FOREIGN KEY (venta_id)    REFERENCES ventas(id),
                 FOREIGN KEY (producto_id) REFERENCES productos(id)
             );
+
+            CREATE INDEX IF NOT EXISTS idx_lotes_inventario_producto_fecha
+            ON lotes_inventario (producto_id, fecha_ingreso, id);
+
+            CREATE INDEX IF NOT EXISTS idx_movimientos_inventario_producto_fecha
+            ON movimientos_inventario (producto_id, fecha, id);
         """)
         # Migración: agregar columnas a BD existente sin perder datos
         for sql in [
@@ -165,6 +198,7 @@ def init_db():
             "ALTER TABLE clientes ADD COLUMN fecha_alta TEXT NOT NULL DEFAULT (datetime('now','localtime'))",
             "ALTER TABLE movimientos_caja ADD COLUMN usuario TEXT DEFAULT 'admin'",
             "ALTER TABLE movimientos_caja ADD COLUMN notas TEXT DEFAULT ''",
+            "ALTER TABLE movimientos_inventario ADD COLUMN precio_venta REAL NOT NULL DEFAULT 0",
         ]:
             try:
                 conn.execute(sql)
@@ -210,6 +244,123 @@ def init_db():
             " SELECT DISTINCT TRIM(categoria) FROM productos"
             " WHERE categoria IS NOT NULL AND TRIM(categoria) <> ''"
         )
+
+        cur_lotes = conn.execute("SELECT COUNT(*) FROM lotes_inventario")
+        if cur_lotes.fetchone()[0] == 0:
+            for producto_id, costo, stock in conn.execute(
+                "SELECT id, costo, stock FROM productos WHERE stock > 0"
+            ).fetchall():
+                _insertar_lote_inventario(
+                    conn,
+                    producto_id=producto_id,
+                    costo_unitario=costo,
+                    cantidad=stock,
+                    fecha_ingreso=_ahora_local()
+                )
+        conn.commit()
+    except Exception:
+        conn.rollback()
+        raise
+    finally:
+        conn.close()
+
+def _ahora_local():
+    return datetime.datetime.now().strftime("%Y-%m-%d %H:%M:%S")
+
+def _insertar_lote_inventario(conn, producto_id, costo_unitario, cantidad, fecha_ingreso=None):
+    cantidad = round(float(cantidad), 3)
+    if cantidad <= 1e-9:
+        return
+    conn.execute(
+        "INSERT INTO lotes_inventario"
+        " (producto_id,fecha_ingreso,costo_unitario,cantidad_inicial,cantidad_disponible)"
+        " VALUES (?,?,?,?,?)",
+        (
+            producto_id,
+            fecha_ingreso or _ahora_local(),
+            float(costo_unitario),
+            cantidad,
+            cantidad
+        )
+    )
+
+def _total_lotes_disponibles(conn, producto_id):
+    row = conn.execute(
+        "SELECT IFNULL(SUM(cantidad_disponible),0) FROM lotes_inventario WHERE producto_id = ?",
+        (producto_id,)
+    ).fetchone()
+    return round(float(row[0] or 0), 3)
+
+def _consumir_lotes_peps(conn, producto_id, nombre_producto, cantidad, precio_venta):
+    restante = round(float(cantidad), 3)
+    if restante <= 1e-9:
+        return 0.0, 0.0, 0.0
+
+    lotes = conn.execute(
+        "SELECT id, costo_unitario, cantidad_disponible"
+        " FROM lotes_inventario"
+        " WHERE producto_id = ? AND cantidad_disponible > 0"
+        " ORDER BY fecha_ingreso ASC, id ASC",
+        (producto_id,)
+    ).fetchall()
+
+    costo_total = 0.0
+    ganancia_total = 0.0
+    for lote_id, costo_unitario, cantidad_disponible in lotes:
+        if restante <= 1e-9:
+            break
+        disponible = round(float(cantidad_disponible or 0), 3)
+        if disponible <= 1e-9:
+            continue
+        tomado = min(restante, disponible)
+        nuevo_disponible = round(disponible - tomado, 3)
+        if nuevo_disponible <= 1e-9:
+            nuevo_disponible = 0.0
+        conn.execute(
+            "UPDATE lotes_inventario SET cantidad_disponible = ? WHERE id = ?",
+            (nuevo_disponible, lote_id)
+        )
+        costo_unitario = float(costo_unitario or 0)
+        costo_total += tomado * costo_unitario
+        if precio_venta is not None:
+            ganancia_total += (float(precio_venta) - costo_unitario) * tomado
+        restante = round(restante - tomado, 3)
+
+    if restante > 1e-9:
+        raise RuntimeError(
+            f'No hay lotes suficientes para completar la venta de "{nombre_producto}".'
+        )
+
+    costo_unitario_real = 0.0 if float(cantidad) <= 1e-9 else costo_total / float(cantidad)
+    return round(costo_unitario_real, 6), round(costo_total, 6), round(ganancia_total, 6)
+
+def _registrar_movimiento_inventario(
+    conn, producto_id, tipo, cantidad, costo_unitario, costo_total,
+    stock_anterior, stock_posterior, motivo, referencia="", precio_venta=0
+):
+    tipo = (tipo or "").strip().upper()
+    if tipo not in ("ENTRADA", "SALIDA"):
+        raise ValueError("Tipo de movimiento de inventario inválido.")
+    cantidad = round(float(cantidad), 3)
+    if cantidad <= 1e-9:
+        raise ValueError("La cantidad del movimiento debe ser mayor a 0.")
+    conn.execute(
+        "INSERT INTO movimientos_inventario"
+        " (fecha,producto_id,tipo,cantidad,precio_venta,costo_unitario,costo_total,stock_anterior,stock_posterior,motivo,referencia)"
+        " VALUES (datetime('now','localtime'),?,?,?,?,?,?,?,?,?,?)",
+        (
+            producto_id,
+            tipo,
+            cantidad,
+            round(float(precio_venta or 0), 6),
+            round(float(costo_unitario or 0), 6),
+            round(float(costo_total or 0), 6),
+            round(float(stock_anterior or 0), 3),
+            round(float(stock_posterior or 0), 3),
+            (motivo or "").strip(),
+            (referencia or "").strip()
+        )
+    )
 
 def _generar_codigo_unico():
     with get_conn() as conn:
@@ -357,11 +508,13 @@ def generar_docx_inventario(productos, ruta_salida):
     rt2 = tp.add_run("INVENTARIO DE PRODUCTOS")
     rt2.bold=True; rt2.font.size=Pt(10); rt2.font.name="Arial"
     rt2.font.color.rgb=_rgb(CLR["bosque"])
-    total_stock = sum(p[5] for p in productos)
+    total_valor_costo = sum(float(p[5] or 0) * float(p[4] or 0) for p in productos)
+    total_valor_venta = sum(float(p[5] or 0) * float(p[3] or 0) for p in productos)
     rp = doc.add_paragraph(); rp.paragraph_format.space_after = Pt(3)
     rr2 = rp.add_run(
         f"Total de registros: {len(productos)} productos  •  "
-        f"Stock total en sistema: {total_stock} unidades")
+        f"Valor total inventario a costo: ${total_valor_costo:,.2f}  •  "
+        f"Valor total inventario a precio de venta: ${total_valor_venta:,.2f}")
     rr2.font.size=Pt(8.5); rr2.font.name="Arial"; rr2.font.color.rgb=_rgb(CLR["hier"])
 
     inv = doc.add_table(rows=1, cols=n); _tbl_fixed(inv)
@@ -394,15 +547,25 @@ def generar_docx_inventario(productos, ruta_salida):
                             color=col if col else CLR["txt"],align=alns[j],bg=bg)
                 _cell_borders(dr.cells[j],CLR["borde"])
 
-    tr = inv.add_row(); tl = tr.cells[0]
-    for j in range(1,6): tl = tl.merge(tr.cells[j])
-    _cell_write(tl,"TOTAL DE UNIDADES EN SISTEMA:",bold=True,size=9.5,
+    tr1 = inv.add_row(); tl1 = tr1.cells[0]
+    for j in range(1,8): tl1 = tl1.merge(tr1.cells[j])
+    total_costo_cell = tr1.cells[8].merge(tr1.cells[9])
+    _cell_write(tl1,"VALOR TOTAL DEL INVENTARIO A COSTO:",bold=True,size=9.5,
                 color=CLR["bco"],bg=CLR["bosque"],align=WD_ALIGN_PARAGRAPH.RIGHT)
-    _cell_borders(tl,CLR["borde_o"],5)
-    _cell_write(tr.cells[6],str(total_stock),bold=True,size=10,
-                color=CLR["bco"],bg=CLR["bosque"]); _cell_borders(tr.cells[6],CLR["borde_o"],5)
-    for j in range(7,n):
-        _cell_write(tr.cells[j],"",bg=CLR["fila"]); _cell_borders(tr.cells[j],CLR["borde"])
+    _cell_borders(tl1,CLR["borde_o"],5)
+    _cell_write(total_costo_cell,f"${total_valor_costo:,.2f}",bold=True,size=10,
+                color=CLR["bco"],bg=CLR["bosque"],align=WD_ALIGN_PARAGRAPH.CENTER)
+    _cell_borders(total_costo_cell,CLR["borde_o"],5)
+
+    tr2 = inv.add_row(); tl2 = tr2.cells[0]
+    for j in range(1,8): tl2 = tl2.merge(tr2.cells[j])
+    total_venta_cell = tr2.cells[8].merge(tr2.cells[9])
+    _cell_write(tl2,"VALOR TOTAL DEL INVENTARIO A PRECIO DE VENTA:",bold=True,size=9.5,
+                color=CLR["bco"],bg=CLR["hier"],align=WD_ALIGN_PARAGRAPH.RIGHT)
+    _cell_borders(tl2,CLR["borde_o"],5)
+    _cell_write(total_venta_cell,f"${total_valor_venta:,.2f}",bold=True,size=10,
+                color=CLR["bco"],bg=CLR["hier"],align=WD_ALIGN_PARAGRAPH.CENTER)
+    _cell_borders(total_venta_cell,CLR["borde_o"],5)
     for i,(_,w) in enumerate(COLS): _col_width(inv,i,w)
 
     # ── Instrucciones ──────────────────────────────────────
@@ -1242,8 +1405,9 @@ class PuntoDeVenta(tk.Tk):
             venta_id = cur.lastrowid
 
             for item in self.carrito:
-                sub = item["precio"] * item["cantidad"]
-                ganancia = (item["precio"] - item["costo"]) * item["cantidad"]
+                cantidad_vendida = float(item["cantidad"])
+                es_granel = bool(item.get("es_granel", False))
+                sub = item["precio"] * cantidad_vendida
                 row_stock = conn.execute(
                     "SELECT stock FROM productos WHERE id = ?",
                     (item["id"],)
@@ -1251,25 +1415,44 @@ class PuntoDeVenta(tk.Tk):
                 if not row_stock:
                     raise RuntimeError(f'El producto "{item["nombre"]}" no existe en la base de datos.')
                 stock_actual = float(row_stock[0])
-                if stock_actual + 1e-9 < float(item["cantidad"]):
-                    es_granel = bool(item.get("es_granel", False))
+                stock_lotes = _total_lotes_disponibles(conn, item["id"])
+                if abs(stock_actual - stock_lotes) > 1e-6:
+                    raise RuntimeError(
+                        f'Discrepancia de inventario en "{item["nombre"]}". '
+                        f'Stock global: {self._fmt_unidades(stock_actual, es_granel, es_granel)} | '
+                        f'lotes: {self._fmt_unidades(stock_lotes, es_granel, es_granel)}'
+                    )
+                if stock_actual + 1e-9 < cantidad_vendida:
                     raise RuntimeError(
                         f'Stock insuficiente para "{item["nombre"]}". '
                         f'Disponible: {self._fmt_unidades(stock_actual, es_granel, es_granel)}'
                     )
+                if stock_lotes + 1e-9 < cantidad_vendida:
+                    raise RuntimeError(
+                        f'Lotes insuficientes para "{item["nombre"]}". '
+                        f'Disponible en lotes: {self._fmt_unidades(stock_lotes, es_granel, es_granel)}'
+                    )
+
+                costo_unitario_real, _costo_total, ganancia = _consumir_lotes_peps(
+                    conn,
+                    producto_id=item["id"],
+                    nombre_producto=item["nombre"],
+                    cantidad=cantidad_vendida,
+                    precio_venta=item["precio"]
+                )
 
                 conn.execute(
                     "INSERT INTO detalle_venta"
                     " (venta_id,producto_id,nombre,precio,costo,cantidad,subtotal,ganancia,es_granel)"
                     " VALUES (?,?,?,?,?,?,?,?,?)",
                     (
-                        venta_id, item["id"], item["nombre"], item["precio"], item["costo"],
-                        item["cantidad"], sub, ganancia, int(bool(item.get("es_granel", False)))
+                        venta_id, item["id"], item["nombre"], item["precio"], costo_unitario_real,
+                        cantidad_vendida, sub, ganancia, int(es_granel)
                     )
                 )
                 conn.execute(
                     "UPDATE productos SET stock = stock - ? WHERE id = ?",
-                    (item["cantidad"], item["id"])
+                    (cantidad_vendida, item["id"])
                 )
 
             if cliente_id is not None:
@@ -1291,7 +1474,7 @@ class PuntoDeVenta(tk.Tk):
         except RuntimeError as e:
             if conn:
                 conn.rollback()
-            messagebox.showwarning("Venta no registrada", str(e), parent=self)
+            messagebox.showerror("Venta no registrada", str(e), parent=self)
             return
         except sqlite3.Error as e:
             if conn:
@@ -2197,6 +2380,14 @@ class PuntoDeVenta(tk.Tk):
         tk.Button(btn_frame, text="＋ Guardar", bg=C["accent"], fg=C["white"],
               bd=0, font=("Courier", 10, "bold"), padx=12, pady=6, cursor="hand2",
               command=self._guardar_producto).pack(side="left", padx=(0,4))
+        tk.Button(btn_frame, text="➖ Descontar stock", bg=C["yellow"], fg=C["bg"],
+              bd=0, font=("Courier", 10, "bold"), padx=12, pady=6, cursor="hand2",
+              activebackground="#d4a514",
+              command=self._descontar_stock_producto).pack(side="left", padx=(0,4))
+        tk.Button(btn_frame, text="🧾 Ver lotes", bg=C["panel"], fg=C["text"],
+              bd=0, font=("Courier", 10), padx=12, pady=6, cursor="hand2",
+              activebackground=C["hover"],
+              command=self._abrir_vista_lotes).pack(side="left", padx=(0,4))
         tk.Button(btn_frame, text="✕ Eliminar", bg=C["red"], fg=C["white"],
               bd=0, font=("Courier", 10), padx=12, pady=6, cursor="hand2",
               command=self._eliminar_producto).pack(side="left", padx=(0,4))
@@ -2297,6 +2488,494 @@ class PuntoDeVenta(tk.Tk):
         self.sv_es_granel.set(str(granel).strip().lower() in ("sí", "si", "1", "true"))
         self._editing_id = int(pid)
 
+    def _producto_lotes_contexto(self):
+        producto_id = None
+        sel = self.tabla_prod.selection() if hasattr(self, "tabla_prod") else ()
+        if sel:
+            try:
+                producto_id = int(sel[0])
+            except (TypeError, ValueError):
+                producto_id = None
+        elif getattr(self, "_editing_id", None):
+            producto_id = int(self._editing_id)
+        if not producto_id:
+            return None
+        with get_conn() as conn:
+            return conn.execute(
+                "SELECT id,codigo,nombre,stock,a_granel FROM productos WHERE id = ?",
+                (producto_id,)
+            ).fetchone()
+
+    def _descontar_stock_producto(self):
+        try:
+            contexto = self._producto_lotes_contexto()
+        except sqlite3.Error as e:
+            messagebox.showerror(
+                "Error de base de datos",
+                f"No se pudo leer el producto seleccionado.\nDetalle técnico: {e}",
+                parent=self
+            )
+            return
+        if not contexto:
+            messagebox.showinfo(
+                "Selecciona un producto",
+                "Haz clic en un producto de la tabla para descontar inventario.",
+                parent=self
+            )
+            return
+
+        producto_id, codigo, nombre, stock_actual, a_granel = contexto
+        es_granel = bool(a_granel)
+        dlg = tk.Toplevel(self)
+        dlg.withdraw()
+        dlg.title("Descontar inventario")
+        dlg.configure(bg=C["card"])
+        dlg.resizable(False, False)
+        dlg.transient(self)
+
+        tk.Label(dlg, text="DESCONTAR INVENTARIO", fg=C["yellow"], bg=C["card"],
+                 font=("Courier", 12, "bold")).pack(pady=(16, 4))
+        tk.Label(dlg, text=f"{codigo} | {nombre}", fg=C["text"], bg=C["card"],
+                 font=("Courier", 10, "bold"), wraplength=420,
+                 justify="center").pack(pady=(0, 6))
+        tk.Label(
+            dlg,
+            text=f"Disponible: {self._fmt_unidades(stock_actual, es_granel, es_granel)}",
+            fg=C["muted"], bg=C["card"], font=("Courier", 9)
+        ).pack()
+        tk.Label(
+            dlg,
+            text="Captura la cantidad a descontar y un motivo obligatorio.",
+            fg=C["muted"], bg=C["card"], font=("Courier", 9)
+        ).pack(pady=(4, 10))
+
+        body = tk.Frame(dlg, bg=C["card"])
+        body.pack(fill="x", padx=20)
+
+        sv_cantidad = tk.StringVar(value="")
+        sv_motivo = tk.StringVar(value="")
+
+        tk.Label(body, text="Cantidad a descontar", fg=C["muted"], bg=C["card"],
+                 font=("Courier", 9)).pack(anchor="w")
+        e_cantidad = tk.Entry(
+            body, textvariable=sv_cantidad,
+            bg=C["panel"], fg=C["text"], insertbackground=C["text"], bd=0,
+            font=("Courier", 12), highlightthickness=1, highlightbackground=C["border"]
+        )
+        e_cantidad.pack(fill="x", ipady=7, pady=(2, 10))
+
+        tk.Label(body, text="Motivo", fg=C["muted"], bg=C["card"],
+                 font=("Courier", 9)).pack(anchor="w")
+        e_motivo = tk.Entry(
+            body, textvariable=sv_motivo,
+            bg=C["panel"], fg=C["text"], insertbackground=C["text"], bd=0,
+            font=("Courier", 11), highlightthickness=1, highlightbackground=C["border"]
+        )
+        e_motivo.pack(fill="x", ipady=7)
+        e_cantidad.focus()
+
+        lbl_error = tk.Label(dlg, text="", fg=C["red"], bg=C["card"],
+                             font=("Courier", 9))
+        lbl_error.pack(pady=(8, 4))
+
+        def _parse_cantidad():
+            texto = sv_cantidad.get().strip().replace(",", ".")
+            if not texto:
+                return None
+            try:
+                return float(texto) if es_granel else int(texto)
+            except ValueError:
+                return None
+
+        def _confirmar():
+            cantidad = _parse_cantidad()
+            motivo = sv_motivo.get().strip()
+            if cantidad is None or float(cantidad) <= 0:
+                lbl_error.config(
+                    text="Ingresa una cantidad válida mayor a 0."
+                    if es_granel else
+                    "Ingresa una cantidad entera válida mayor a 0."
+                )
+                return
+            if float(cantidad) > float(stock_actual) + 1e-9:
+                lbl_error.config(
+                    text=f"Stock insuficiente. Máximo: {self._fmt_unidades(stock_actual, es_granel, es_granel)}"
+                )
+                return
+            if not motivo:
+                lbl_error.config(text="Debes capturar un motivo para guardar el ajuste.")
+                return
+
+            conn = None
+            try:
+                conn = get_conn()
+                conn.execute("BEGIN")
+                row = conn.execute(
+                    "SELECT nombre, stock, a_granel, precio FROM productos WHERE id = ?",
+                    (producto_id,)
+                ).fetchone()
+                if not row:
+                    raise RuntimeError("El producto ya no existe en la base de datos.")
+                nombre_actual, stock_db, a_granel_db, precio_venta_db = row
+                es_granel_db = bool(a_granel_db)
+                stock_db = float(stock_db or 0)
+                stock_lotes = _total_lotes_disponibles(conn, producto_id)
+                if abs(stock_db - stock_lotes) > 1e-6:
+                    raise RuntimeError(
+                        f'Discrepancia de inventario en "{nombre_actual}". '
+                        f'Stock global: {self._fmt_unidades(stock_db, es_granel_db, es_granel_db)} | '
+                        f'lotes: {self._fmt_unidades(stock_lotes, es_granel_db, es_granel_db)}'
+                    )
+
+                cantidad_desc = round(float(cantidad), 3)
+                if stock_db + 1e-9 < cantidad_desc:
+                    raise RuntimeError(
+                        f'Stock insuficiente para "{nombre_actual}". '
+                        f'Disponible: {self._fmt_unidades(stock_db, es_granel_db, es_granel_db)}'
+                    )
+
+                costo_unitario, costo_total, _ganancia = _consumir_lotes_peps(
+                    conn,
+                    producto_id=producto_id,
+                    nombre_producto=nombre_actual,
+                    cantidad=cantidad_desc,
+                    precio_venta=None
+                )
+                stock_nuevo = round(stock_db - cantidad_desc, 3)
+                if stock_nuevo <= 1e-9:
+                    stock_nuevo = 0.0
+
+                conn.execute(
+                    "UPDATE productos SET stock = stock - ? WHERE id = ?",
+                    (cantidad_desc, producto_id)
+                )
+                _registrar_movimiento_inventario(
+                    conn,
+                    producto_id=producto_id,
+                    tipo="SALIDA",
+                    cantidad=cantidad_desc,
+                    costo_unitario=costo_unitario,
+                    costo_total=costo_total,
+                    stock_anterior=stock_db,
+                    stock_posterior=stock_nuevo,
+                    motivo=motivo,
+                    referencia="AJUSTE_MANUAL",
+                    precio_venta=precio_venta_db
+                )
+                conn.commit()
+            except RuntimeError as e:
+                if conn:
+                    conn.rollback()
+                messagebox.showerror("Ajuste no aplicado", str(e), parent=dlg)
+                return
+            except sqlite3.Error as e:
+                if conn:
+                    conn.rollback()
+                messagebox.showerror(
+                    "Error de base de datos",
+                    f"No se pudo descontar inventario.\nDetalle técnico: {e}",
+                    parent=dlg
+                )
+                return
+            except Exception as e:
+                if conn:
+                    conn.rollback()
+                messagebox.showerror(
+                    "Error inesperado",
+                    f"No se pudo descontar inventario.\nDetalle: {e}",
+                    parent=dlg
+                )
+                return
+            finally:
+                if conn:
+                    conn.close()
+
+            dlg.destroy()
+            messagebox.showinfo(
+                "OK",
+                f'Se descontó {self._fmt_unidades(cantidad_desc, es_granel, es_granel)} de "{nombre}".',
+                parent=self
+            )
+            self._cargar_tabla_productos()
+            self._cargar_productos()
+            self._seleccionar_fila_producto(producto_id)
+
+        btns = tk.Frame(dlg, bg=C["card"])
+        btns.pack(fill="x", padx=20, pady=(8, 12))
+        tk.Button(btns, text="✔ Aplicar", bg=C["yellow"], fg=C["bg"], bd=0,
+                  font=("Courier", 10, "bold"), pady=8, cursor="hand2",
+                  activebackground="#d4a514",
+                  command=_confirmar).pack(side="left", fill="x", expand=True, padx=(0, 4))
+        tk.Button(btns, text="✕ Cancelar", bg=C["panel"], fg=C["muted"], bd=0,
+                  font=("Courier", 10), pady=8, cursor="hand2",
+                  command=dlg.destroy).pack(side="left", fill="x", expand=True)
+
+        dlg.bind("<Return>", lambda e: _confirmar())
+        dlg.bind("<Escape>", lambda e: dlg.destroy())
+        dlg.protocol("WM_DELETE_WINDOW", dlg.destroy)
+        self.update_idletasks()
+        dlg.update_idletasks()
+        x = self.winfo_x() + (self.winfo_width() // 2) - 240
+        y = self.winfo_y() + (self.winfo_height() // 2) - 170
+        dlg.geometry(f"480x340+{x}+{y}")
+        dlg.deiconify()
+        dlg.grab_set()
+        dlg.focus_force()
+
+    def _seleccionar_fila_producto(self, producto_id):
+        if not hasattr(self, "tabla_prod"):
+            return False
+        iid = str(producto_id)
+        if not self.tabla_prod.exists(iid):
+            return False
+        self.tabla_prod.selection_set(iid)
+        self.tabla_prod.focus(iid)
+        self.tabla_prod.focus_set()
+        self._editing_id = int(producto_id)
+        self._llenar_form_producto()
+        return True
+
+    def _abrir_vista_lotes(self):
+        try:
+            contexto = self._producto_lotes_contexto()
+        except sqlite3.Error as e:
+            messagebox.showerror(
+                "Error de base de datos",
+                f"No se pudo leer el producto seleccionado.\nDetalle técnico: {e}",
+                parent=self
+            )
+            return
+
+        dlg = tk.Toplevel(self)
+        dlg.withdraw()
+        dlg.title("Consulta de lotes")
+        dlg.configure(bg=C["card"])
+        dlg.transient(self)
+        dlg.resizable(True, True)
+        dlg.minsize(1020, 620)
+
+        tk.Label(dlg, text="CONSULTA DE LOTES DE INVENTARIO",
+                 fg=C["accent2"], bg=C["card"], font=("Courier", 11, "bold")).pack(
+                     anchor="w", padx=16, pady=(16, 4)
+                 )
+
+        sv_info = tk.StringVar(value="")
+        tk.Label(dlg, textvariable=sv_info, fg=C["muted"], bg=C["card"],
+                 font=("Courier", 9), justify="left", anchor="w").pack(
+                     fill="x", padx=16, pady=(0, 10)
+                 )
+
+        topbar = tk.Frame(dlg, bg=C["card"])
+        topbar.pack(fill="x", padx=16, pady=(0, 8))
+
+        tk.Label(dlg, text="LOTES DISPONIBLES", fg=C["muted"], bg=C["card"],
+                 font=("Courier", 9, "bold")).pack(anchor="w", padx=16, pady=(0, 4))
+
+        frame_t = tk.Frame(dlg, bg=C["bg"], height=250)
+        frame_t.pack(fill="both", expand=True, padx=16, pady=(0, 12))
+        frame_t.pack_propagate(False)
+
+        cols = ("lote","codigo","nombre","fecha","precio","costo","inicial","disponible","estado")
+        heads = ("Lote","Código","Producto","Fecha ingreso","Precio venta","Costo","Cant. inicial","Cant. disponible","Estado")
+        widths = [60, 85, 180, 145, 90, 80, 110, 120, 85]
+        tabla = ttk.Treeview(frame_t, columns=cols, show="headings", style="POS.Treeview")
+        for c, h, w in zip(cols, heads, widths):
+            tabla.heading(c, text=h, anchor="center")
+            tabla.column(c, width=w, anchor="center", stretch=True)
+
+        sb = ttk.Scrollbar(frame_t, orient="vertical", command=tabla.yview)
+        tabla.configure(yscrollcommand=sb.set)
+        tabla.pack(side="left", fill="both", expand=True)
+        sb.pack(side="right", fill="y")
+        tabla.tag_configure("agotado", foreground=C["red"])
+
+        tk.Label(dlg, text="DESCUENTOS MANUALES REGISTRADOS", fg=C["muted"], bg=C["card"],
+                 font=("Courier", 9, "bold")).pack(anchor="w", padx=16, pady=(0, 4))
+
+        frame_mov = tk.Frame(dlg, bg=C["bg"], height=210)
+        frame_mov.pack(fill="both", expand=True, padx=16, pady=(0, 12))
+        frame_mov.pack_propagate(False)
+
+        cols_mov = ("fecha","codigo","nombre","cantidad","precio","costo","total","antes","despues","motivo")
+        heads_mov = ("Fecha","Código","Producto","Cant.","Precio venta","Costo unit.","Costo total","Stock antes","Stock después","Motivo")
+        widths_mov = [145, 85, 170, 90, 95, 90, 95, 100, 105, 220]
+        tabla_mov = ttk.Treeview(frame_mov, columns=cols_mov, show="headings", style="POS.Treeview")
+        for c, h, w in zip(cols_mov, heads_mov, widths_mov):
+            tabla_mov.heading(c, text=h, anchor="center")
+            tabla_mov.column(c, width=w, anchor="center", stretch=True)
+
+        sb_mov = ttk.Scrollbar(frame_mov, orient="vertical", command=tabla_mov.yview)
+        tabla_mov.configure(yscrollcommand=sb_mov.set)
+        tabla_mov.pack(side="left", fill="both", expand=True)
+        sb_mov.pack(side="right", fill="y")
+
+        estado = {
+            "producto_id": contexto[0] if contexto else None,
+            "contexto": contexto
+        }
+
+        def _cargar_lotes():
+            for row in tabla.get_children():
+                tabla.delete(row)
+            for row in tabla_mov.get_children():
+                tabla_mov.delete(row)
+            try:
+                with get_conn() as conn:
+                    params = ()
+                    where = ""
+                    if estado["producto_id"] is not None:
+                        where = " WHERE p.id = ?"
+                        params = (estado["producto_id"],)
+                    rows = conn.execute(
+                        "SELECT l.id, p.id, p.codigo, p.nombre, l.fecha_ingreso,"
+                        " l.costo_unitario, l.cantidad_inicial, l.cantidad_disponible,"
+                        " p.stock, p.a_granel, p.precio"
+                        " FROM lotes_inventario l"
+                        " JOIN productos p ON p.id = l.producto_id"
+                        f"{where}"
+                        " ORDER BY p.nombre, l.fecha_ingreso, l.id",
+                        params
+                    ).fetchall()
+                    where_mov = " WHERE m.referencia = 'AJUSTE_MANUAL'"
+                    params_mov = ()
+                    if estado["producto_id"] is not None:
+                        where_mov += " AND p.id = ?"
+                        params_mov = (estado["producto_id"],)
+                    rows_mov = conn.execute(
+                        "SELECT m.fecha, p.codigo, p.nombre, m.cantidad, m.precio_venta,"
+                        " m.costo_unitario, m.costo_total, m.stock_anterior, m.stock_posterior,"
+                        " m.motivo, p.a_granel"
+                        " FROM movimientos_inventario m"
+                        " JOIN productos p ON p.id = m.producto_id"
+                        f"{where_mov}"
+                        " ORDER BY m.fecha DESC, m.id DESC",
+                        params_mov
+                    ).fetchall()
+            except sqlite3.Error as e:
+                messagebox.showerror(
+                    "Error de base de datos",
+                    f"No se pudieron consultar los lotes.\nDetalle técnico: {e}",
+                    parent=dlg
+                )
+                return
+
+            productos = set()
+            for lote_id, producto_id, codigo, nombre, fecha_ingreso, costo_unitario, cant_ini, cant_disp, _stock, a_granel, precio_venta in rows:
+                es_granel = bool(a_granel)
+                productos.add(producto_id)
+                tags = ("agotado",) if float(cant_disp or 0) <= 1e-9 else ()
+                tabla.insert(
+                    "",
+                    "end",
+                    values=(
+                        lote_id,
+                        codigo,
+                        nombre,
+                        fecha_ingreso,
+                        f"${float(precio_venta or 0):.2f}",
+                        f"${float(costo_unitario or 0):.2f}",
+                        self._fmt_unidades(cant_ini, es_granel, es_granel),
+                        self._fmt_unidades(cant_disp, es_granel, es_granel),
+                        "Agotado" if tags else "Activo"
+                    ),
+                    tags=tags
+                )
+
+            for fecha_mov, codigo_mov, nombre_mov, cantidad_mov, precio_mov, costo_mov, total_mov, stock_ant, stock_pos, motivo_mov, a_granel_mov in rows_mov:
+                es_granel_mov = bool(a_granel_mov)
+                tabla_mov.insert(
+                    "",
+                    "end",
+                    values=(
+                        fecha_mov,
+                        codigo_mov,
+                        nombre_mov,
+                        self._fmt_unidades(cantidad_mov, es_granel_mov, es_granel_mov),
+                        f"${float(precio_mov or 0):.2f}",
+                        f"${float(costo_mov or 0):.2f}",
+                        f"${float(total_mov or 0):.2f}",
+                        self._fmt_unidades(stock_ant, es_granel_mov, es_granel_mov),
+                        self._fmt_unidades(stock_pos, es_granel_mov, es_granel_mov),
+                        motivo_mov
+                    )
+                )
+
+            contexto_actual = estado["contexto"]
+            if estado["producto_id"] is not None and contexto_actual and contexto_actual[0] == estado["producto_id"]:
+                stock_global = float(contexto_actual[3] or 0)
+                es_granel = bool(contexto_actual[4])
+                stock_lotes = round(sum(float(r[7] or 0) for r in rows), 3)
+                sv_info.set(
+                    f'Producto: {contexto_actual[1]} | {contexto_actual[2]}   •   '
+                    f'Stock global: {self._fmt_unidades(stock_global, es_granel, es_granel)}   •   '
+                    f'Stock en lotes: {self._fmt_unidades(stock_lotes, es_granel, es_granel)}   •   '
+                    f'Lotes: {len(rows)}   •   Descuentos manuales: {len(rows_mov)}'
+                )
+            elif estado["producto_id"] is not None:
+                sv_info.set(
+                    f"Producto seleccionado sin lotes registrados. "
+                    f"Lotes: {len(rows)}   •   Descuentos manuales: {len(rows_mov)}"
+                )
+            else:
+                sv_info.set(
+                    f"Mostrando todos los lotes   •   Productos con lotes: {len(productos)}   •   "
+                    f"Lotes: {len(rows)}   •   Descuentos manuales: {len(rows_mov)}"
+                )
+
+        def _ver_producto_actual():
+            try:
+                actual = self._producto_lotes_contexto()
+            except sqlite3.Error as e:
+                messagebox.showerror(
+                    "Error de base de datos",
+                    f"No se pudo leer el producto seleccionado.\nDetalle técnico: {e}",
+                    parent=dlg
+                )
+                return
+            if not actual:
+                messagebox.showinfo(
+                    "Selecciona un producto",
+                    "Haz clic en un producto de la tabla para ver sus lotes.",
+                    parent=dlg
+                )
+                return
+            estado["producto_id"] = actual[0]
+            estado["contexto"] = actual
+            _cargar_lotes()
+
+        def _ver_todos():
+            estado["producto_id"] = None
+            estado["contexto"] = None
+            _cargar_lotes()
+
+        tk.Button(topbar, text="📦 Producto actual", bg=C["accent"], fg=C["white"], bd=0,
+                  font=("Courier", 10, "bold"), padx=10, pady=6, cursor="hand2",
+                  command=_ver_producto_actual).pack(side="left", padx=(0, 4))
+        tk.Button(topbar, text="🗂 Todos", bg=C["panel"], fg=C["text"], bd=0,
+                  font=("Courier", 10), padx=10, pady=6, cursor="hand2",
+                  activebackground=C["hover"],
+                  command=_ver_todos).pack(side="left", padx=(0, 4))
+        tk.Button(topbar, text="⟳ Recargar", bg=C["panel"], fg=C["muted"], bd=0,
+                  font=("Courier", 10), padx=10, pady=6, cursor="hand2",
+                  activebackground=C["hover"],
+                  command=_cargar_lotes).pack(side="left")
+        tk.Button(topbar, text="✕ Cerrar", bg=C["card"], fg=C["muted"], bd=0,
+                  font=("Courier", 10), padx=10, pady=6, cursor="hand2",
+                  activebackground=C["hover"],
+                  command=dlg.destroy).pack(side="right")
+
+        self.update_idletasks()
+        dlg.update_idletasks()
+        x = self.winfo_x() + (self.winfo_width() // 2) - 500
+        y = self.winfo_y() + (self.winfo_height() // 2) - 310
+        dlg.geometry(f"1040x640+{x}+{y}")
+        dlg.deiconify()
+        dlg.grab_set()
+        dlg.focus_force()
+        _cargar_lotes()
+        dlg.bind("<Escape>", lambda e: dlg.destroy())
+        dlg.protocol("WM_DELETE_WINDOW", dlg.destroy)
+
     def _guardar_producto(self):
         try:
             codigo   = self._prod_entries["e_codigo"].get().strip()
@@ -2347,24 +3026,83 @@ class PuntoDeVenta(tk.Tk):
         self.sv_categoria_producto.set(categoria)
 
         eid = getattr(self, "_editing_id", None)
-        with get_conn() as conn:
+        conn = None
+        try:
+            conn = get_conn()
+            conn.execute("BEGIN")
             if eid:
+                row_actual = conn.execute(
+                    "SELECT stock, a_granel FROM productos WHERE id = ?",
+                    (eid,)
+                ).fetchone()
+                if not row_actual:
+                    raise RuntimeError("El producto que intentas editar ya no existe.")
+                stock_actual = float(row_actual[0] or 0)
+                es_granel_actual = bool(row_actual[1])
+                stock_lotes = _total_lotes_disponibles(conn, eid)
+                if abs(stock_actual - stock_lotes) > 1e-6:
+                    raise RuntimeError(
+                        f'Discrepancia de inventario en "{nombre}". '
+                        f'Stock global: {self._fmt_unidades(stock_actual, es_granel_actual, es_granel_actual)} | '
+                        f'lotes: {self._fmt_unidades(stock_lotes, es_granel_actual, es_granel_actual)}'
+                    )
+                if stock + 1e-9 < stock_actual:
+                    raise RuntimeError(
+                        "No se permite reducir el stock manualmente con PEPS. "
+                        "Usa el botón 'Descontar stock' o registra una venta para descontar inventario."
+                    )
                 conn.execute(
                     "UPDATE productos SET codigo=?,nombre=?,costo=?,precio=?,stock=?,categoria=?,a_granel=?,caducidad=?"
                     " WHERE id=?",
-                    (codigo, nombre, costo, precio, stock, categoria, int(es_granel), caducidad, eid))
+                    (codigo, nombre, costo, precio, stock, categoria, int(es_granel), caducidad, eid)
+                )
+                diferencia = round(float(stock) - stock_actual, 3)
+                if diferencia > 1e-9:
+                    _insertar_lote_inventario(conn, eid, costo, diferencia)
                 msg = "Producto actualizado."
             else:
-                try:
-                    conn.execute(
-                        "INSERT INTO productos (codigo,nombre,costo,precio,stock,categoria,a_granel,caducidad)"
-                        " VALUES (?,?,?,?,?,?,?,?)",
-                        (codigo, nombre, costo, precio, stock, categoria, int(es_granel), caducidad))
-                    msg = "Producto agregado."
-                except sqlite3.IntegrityError:
-                    messagebox.showerror("Error",
-                        f'El código "{codigo}" ya existe.', parent=self)
-                    return
+                cur = conn.execute(
+                    "INSERT INTO productos (codigo,nombre,costo,precio,stock,categoria,a_granel,caducidad)"
+                    " VALUES (?,?,?,?,?,?,?,?)",
+                    (codigo, nombre, costo, precio, stock, categoria, int(es_granel), caducidad)
+                )
+                nuevo_id = cur.lastrowid
+                if stock > 0:
+                    _insertar_lote_inventario(conn, nuevo_id, costo, stock)
+                msg = "Producto agregado."
+            conn.commit()
+        except sqlite3.IntegrityError:
+            if conn:
+                conn.rollback()
+            messagebox.showerror("Error",
+                f'El código "{codigo}" ya existe.', parent=self)
+            return
+        except RuntimeError as e:
+            if conn:
+                conn.rollback()
+            messagebox.showerror("Error", str(e), parent=self)
+            return
+        except sqlite3.Error as e:
+            if conn:
+                conn.rollback()
+            messagebox.showerror(
+                "Error de base de datos",
+                f"No se pudo guardar el producto.\nDetalle técnico: {e}",
+                parent=self
+            )
+            return
+        except Exception as e:
+            if conn:
+                conn.rollback()
+            messagebox.showerror(
+                "Error inesperado",
+                f"No se pudo guardar el producto.\nDetalle: {e}",
+                parent=self
+            )
+            return
+        finally:
+            if conn:
+                conn.close()
         messagebox.showinfo("OK", msg, parent=self)
         self._clear_prod_form_inputs()
         self.sv_es_granel.set(False)
