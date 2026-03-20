@@ -493,6 +493,9 @@ class PuntoDeVenta(tk.Tk):
         self._cliente_id_por_opcion = {"Público general": None}
         self._categorias_contables_cache = []
         self._categorias_producto_cache = []
+        self.selected_product_id = None
+        self.dialog_open = False
+        self.is_processing_add = False
         self._build_ui()
         self._cargar_productos()
         self._cargar_clientes_en_venta()
@@ -594,7 +597,7 @@ class PuntoDeVenta(tk.Tk):
                          bd=0, font=("Courier", 12), highlightthickness=0)
         entry.pack(side="left", fill="x", expand=True, ipady=8)
         entry.focus()
-        entry.bind("<Return>", lambda e: self._agregar_primero_al_carrito())
+        entry.bind("<Return>", self._on_busqueda_return)
         entry.bind("<Down>", lambda e: self._focus_tabla())
 
         cols = ("codigo", "nombre", "precio", "stock")
@@ -627,8 +630,9 @@ class PuntoDeVenta(tk.Tk):
         self.tabla_busq.configure(yscrollcommand=sb.set)
         self.tabla_busq.pack(side="left", fill="both", expand=True)
         sb.pack(side="right", fill="y")
-        self.tabla_busq.bind("<Double-1>", lambda e: self._agregar_seleccionado())
-        self.tabla_busq.bind("<Return>", lambda e: self._agregar_seleccionado())
+        self.tabla_busq.bind("<<TreeviewSelect>>", self._on_tabla_busq_select)
+        self.tabla_busq.bind("<Double-1>", self._on_tabla_busq_double_click)
+        self.tabla_busq.bind("<Return>", self._on_tabla_busq_return)
 
         btn_add = tk.Button(left, text="＋  Agregar al carrito  (↵ Enter)",
                             bg=C["accent"], fg=C["white"], bd=0,
@@ -810,16 +814,11 @@ class PuntoDeVenta(tk.Tk):
 
     def _pedir_cantidad_granel(self, nombre, precio, stock_disponible):
         dlg = tk.Toplevel(self)
+        dlg.withdraw()
         dlg.title("Producto a granel")
         dlg.configure(bg=C["card"])
         dlg.resizable(False, False)
         dlg.transient(self)
-        dlg.grab_set()
-        dlg.focus_set()
-        self.update_idletasks()
-        x = self.winfo_x() + (self.winfo_width()  // 2) - 235
-        y = self.winfo_y() + (self.winfo_height() // 2) - 170
-        dlg.geometry(f"470x340+{x}+{y}")
 
         tk.Label(dlg, text="VENTA A GRANEL", fg=C["accent2"], bg=C["card"],
                  font=("Courier", 12, "bold")).pack(pady=(16, 4))
@@ -928,8 +927,203 @@ class PuntoDeVenta(tk.Tk):
         dlg.bind("<Return>", lambda e: _confirmar())
         dlg.bind("<Escape>", lambda e: _cancelar())
         dlg.protocol("WM_DELETE_WINDOW", _cancelar)
+        self.update_idletasks()
+        dlg.update_idletasks()
+        x = self.winfo_x() + (self.winfo_width()  // 2) - 235
+        y = self.winfo_y() + (self.winfo_height() // 2) - 170
+        dlg.geometry(f"470x340+{x}+{y}")
+        dlg.deiconify()
+        dlg.lift()
+        dlg.grab_set()
+        dlg.focus_force()
         self.wait_window(dlg)
         return resultado["cantidad"]
+
+    def _buscar_producto_por_id(self, pid):
+        return next((p for p in self._productos_cache if p[0] == pid), None)
+
+    def _obtener_item_carrito(self, pid):
+        return next((item for item in self.carrito if item["id"] == pid), None)
+
+    def _stock_disponible_para_producto(self, prod):
+        pid, _codigo, _nombre, _precio, _costo, stock, a_granel, _caducidad, _categoria = prod
+        item_existente = self._obtener_item_carrito(pid)
+        ya_en_carrito = item_existente["cantidad"] if item_existente else 0
+        restante = round(stock - ya_en_carrito, 3)
+        if bool(a_granel):
+            return restante
+        return max(0, int(round(restante)))
+
+    def _seleccionar_producto_en_tabla(self, pid, enfocar=False):
+        if pid is None:
+            return False
+        iid = str(pid)
+        if not self.tabla_busq.exists(iid):
+            return False
+        self.tabla_busq.selection_set(iid)
+        self.tabla_busq.focus(iid)
+        self.selected_product_id = pid
+        if enfocar:
+            self.tabla_busq.focus_set()
+        return True
+
+    def _obtener_pid_seleccionado(self):
+        sel = self.tabla_busq.selection()
+        if sel:
+            try:
+                pid = int(sel[0])
+            except (TypeError, ValueError):
+                return None
+            self.selected_product_id = pid
+            return pid
+        if self.selected_product_id is not None and self.tabla_busq.exists(str(self.selected_product_id)):
+            return self.selected_product_id
+        return None
+
+    def _obtener_producto_seleccionado(self):
+        pid = self._obtener_pid_seleccionado()
+        if pid is None:
+            return None
+        return self._buscar_producto_por_id(pid)
+
+    def _mostrar_aviso_seleccion_producto(self):
+        self.tabla_busq.focus_set()
+        if not self.tabla_busq.get_children():
+            messagebox.showinfo(
+                "Sin productos",
+                "No hay productos disponibles con la búsqueda actual.",
+                parent=self
+            )
+            return
+        messagebox.showinfo(
+            "Selecciona un producto",
+            "Haz clic en un producto de la lista antes de agregarlo al carrito.",
+            parent=self
+        )
+
+    def _pedir_cantidad_granel_para_producto(self, prod):
+        _pid, _codigo, nombre, precio, _costo, _stock, _a_granel, _caducidad, _categoria = prod
+        stock_disponible = self._stock_disponible_para_producto(prod)
+        if stock_disponible <= 0:
+            messagebox.showwarning(
+                "Stock insuficiente",
+                f'Stock máximo disponible: {self._fmt_unidades(stock_disponible, True, True)}',
+                parent=self
+            )
+            return None
+        self.dialog_open = True
+        try:
+            return self._pedir_cantidad_granel(nombre, precio, stock_disponible)
+        finally:
+            self.dialog_open = False
+
+    def _agregar_producto_al_carrito(self, prod, cantidad):
+        if cantidad is None or self.is_processing_add:
+            return False
+        self.is_processing_add = True
+        try:
+            pid, codigo, nombre, precio, costo, stock, a_granel, caducidad, _categoria = prod
+            es_granel = bool(a_granel)
+            item_existente = self._obtener_item_carrito(pid)
+            stock_disponible = self._stock_disponible_para_producto(prod)
+            if stock_disponible <= 0:
+                messagebox.showwarning(
+                    "Stock insuficiente",
+                    f'Stock máximo disponible: {self._fmt_unidades(stock_disponible, es_granel, es_granel)}',
+                    parent=self
+                )
+                return False
+            if es_granel:
+                cantidad = round(float(cantidad), 3)
+                if cantidad <= 0 or cantidad > stock_disponible + 1e-9:
+                    messagebox.showwarning(
+                        "Stock insuficiente",
+                        f'Stock máximo disponible: {self._fmt_unidades(stock_disponible, True, True)}',
+                        parent=self
+                    )
+                    return False
+            else:
+                try:
+                    cantidad = int(cantidad)
+                except (TypeError, ValueError):
+                    return False
+                if cantidad <= 0 or cantidad > stock_disponible:
+                    messagebox.showwarning(
+                        "Stock insuficiente",
+                        f'Stock máximo disponible: {self._fmt_unidades(stock_disponible)}',
+                        parent=self
+                    )
+                    return False
+
+            if item_existente:
+                if es_granel:
+                    item_existente["cantidad"] = round(item_existente["cantidad"] + cantidad, 3)
+                else:
+                    item_existente["cantidad"] += cantidad
+            else:
+                self.carrito.append({
+                    "id": pid, "codigo": codigo, "nombre": nombre,
+                    "precio": precio, "costo": costo, "cantidad": cantidad,
+                    "stock": stock, "es_granel": es_granel, "caducidad": caducidad
+                })
+            self._refresh_carrito()
+            self._seleccionar_producto_en_tabla(pid, enfocar=True)
+            return True
+        finally:
+            self.is_processing_add = False
+
+    def _agregar_producto_normal_o_granel(self, prod):
+        if not prod:
+            return False
+        if bool(prod[6]):
+            cantidad = self._pedir_cantidad_granel_para_producto(prod)
+            if cantidad is None:
+                self._seleccionar_producto_en_tabla(prod[0], enfocar=True)
+                return False
+            return self._agregar_producto_al_carrito(prod, cantidad)
+        return self._agregar_producto_al_carrito(prod, 1)
+
+    def _agregar_producto_seleccionado(self):
+        prod = self._obtener_producto_seleccionado()
+        if not prod:
+            self._mostrar_aviso_seleccion_producto()
+            return False
+        return self._agregar_producto_normal_o_granel(prod)
+
+    def _agregar_producto_por_id(self, pid):
+        if not self._seleccionar_producto_en_tabla(pid, enfocar=True):
+            return False
+        prod = self._buscar_producto_por_id(pid)
+        if not prod:
+            return False
+        return self._agregar_producto_normal_o_granel(prod)
+
+    def _on_tabla_busq_select(self, _event=None):
+        self._obtener_pid_seleccionado()
+
+    def _on_tabla_busq_double_click(self, event):
+        iid = self.tabla_busq.identify_row(event.y)
+        if not iid:
+            return
+        try:
+            pid = int(iid)
+        except (TypeError, ValueError):
+            return
+        self.after_idle(lambda pid=pid: self._agregar_producto_por_id(pid))
+        return "break"
+
+    def _on_tabla_busq_return(self, _event=None):
+        self.after_idle(self._agregar_producto_seleccionado)
+        return "break"
+
+    def _on_busqueda_return(self, _event=None):
+        pid = self._obtener_pid_seleccionado()
+        if pid is None:
+            self._focus_tabla()
+            pid = self._obtener_pid_seleccionado()
+        if pid is not None:
+            self.after_idle(lambda pid=pid: self._agregar_producto_por_id(pid))
+        return "break"
 
     # ── Lógica de búsqueda ────────────────────────────────
     def _cargar_productos(self):
@@ -948,8 +1142,10 @@ class PuntoDeVenta(tk.Tk):
 
     def _filtrar_productos(self):
         q = self._texto_busqueda(self.sv_busqueda.get())
+        pid_seleccionado = self._obtener_pid_seleccionado()
         for row in self.tabla_busq.get_children():
             self.tabla_busq.delete(row)
+        visibles = set()
         for prod in self._productos_cache:
             pid, codigo, nombre, precio, costo, stock, a_granel, caducidad, categoria = prod
             codigo_q = self._texto_busqueda(codigo)
@@ -964,79 +1160,31 @@ class PuntoDeVenta(tk.Tk):
                     tags.append("critical")
                 stock_txt = self._fmt_unidades(stock, bool(a_granel), bool(a_granel))
                 nombre_txt = f"⚠ {nombre}" if es_critico else nombre
+                visibles.add(pid)
                 self.tabla_busq.insert("", "end",
                     values=(codigo, nombre_txt, f"${precio:.2f}", stock_txt),
                     iid=str(pid), tags=tuple(tags))
         self.tabla_busq.tag_configure("low", foreground=C["yellow"])
         self.tabla_busq.tag_configure("critical", foreground=C["red"])
+        if pid_seleccionado in visibles:
+            self._seleccionar_producto_en_tabla(pid_seleccionado)
+        else:
+            self.selected_product_id = None
 
     def _focus_tabla(self):
         children = self.tabla_busq.get_children()
-        if children:
-            self.tabla_busq.selection_set(children[0])
-            self.tabla_busq.focus(children[0])
-            self.tabla_busq.focus_set()
+        if not children:
+            return
+        pid = self._obtener_pid_seleccionado()
+        if pid is None:
+            pid = int(children[0])
+        self._seleccionar_producto_en_tabla(pid, enfocar=True)
 
     def _agregar_primero_al_carrito(self):
-        children = self.tabla_busq.get_children()
-        if children:
-            self.tabla_busq.selection_set(children[0])
-            self._agregar_seleccionado()
+        self._focus_tabla()
 
     def _agregar_seleccionado(self):
-        sel = self.tabla_busq.selection()
-        if not sel:
-            self._agregar_primero_al_carrito()
-            return
-        pid = int(sel[0])
-        prod = next((p for p in self._productos_cache if p[0] == pid), None)
-        if not prod:
-            return
-        pid, codigo, nombre, precio, costo, stock, a_granel, caducidad, _categoria = prod
-        es_granel = bool(a_granel)
-        if stock <= 0:
-            messagebox.showwarning("Sin stock",
-                f'"{nombre}" no tiene stock disponible.', parent=self)
-            return
-        item_existente = next((i for i in self.carrito if i["id"] == pid), None)
-        if es_granel:
-            ya_en_carrito = item_existente["cantidad"] if item_existente else 0
-            stock_disponible = round(stock - ya_en_carrito, 3)
-            if stock_disponible <= 0:
-                messagebox.showwarning("Stock insuficiente",
-                    f'Stock máximo: {self._fmt_unidades(stock, True, True)}', parent=self)
-                return
-            cantidad = self._pedir_cantidad_granel(nombre, precio, stock_disponible)
-            if cantidad is None:
-                return
-            if item_existente:
-                item_existente["cantidad"] = round(item_existente["cantidad"] + cantidad, 3)
-            else:
-                self.carrito.append({
-                    "id": pid, "codigo": codigo, "nombre": nombre,
-                    "precio": precio, "costo": costo, "cantidad": cantidad,
-                    "stock": stock, "es_granel": True, "caducidad": caducidad
-                })
-            self._refresh_carrito()
-            self.sv_busqueda.set("")
-            return
-
-        for item in self.carrito:
-            if item["id"] == pid:
-                if item["cantidad"] >= stock:
-                    messagebox.showwarning("Stock insuficiente",
-                        f'Stock máximo: {self._fmt_unidades(stock)}', parent=self)
-                    return
-                item["cantidad"] += 1
-                self._refresh_carrito()
-                self.sv_busqueda.set("")
-                return
-        self.carrito.append({"id": pid, "codigo": codigo, "nombre": nombre,
-                              "precio": precio, "costo": costo,
-                              "cantidad": 1, "stock": stock, "es_granel": False,
-                              "caducidad": caducidad})
-        self._refresh_carrito()
-        self.sv_busqueda.set("")
+        self._agregar_producto_seleccionado()
 
     # ── Carrito ───────────────────────────────────────────
     def _refresh_carrito(self):
