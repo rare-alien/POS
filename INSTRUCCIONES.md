@@ -70,6 +70,10 @@ Copia **exactamente** estos archivos a `C:\PuntoDeVenta\`:
 
 > ⚠️ **Importante:** el `.exe` busca `ventas.db` en **la misma carpeta donde él esté**.
 > Si mueves el `.exe` sin mover la `ventas.db`, el programa creará una base de datos nueva vacía.
+>
+> Si ejecutas `CONSTRUIR_EXE.bat` en una carpeta donde ya existe `ventas.db`,
+> el script copia esa base a `dist\ventas.db` para que puedas probar el `.exe`
+> inmediatamente con tus datos.
 
 ### 3.3 — Estructura final en producción
 

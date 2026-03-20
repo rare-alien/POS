@@ -66,6 +66,14 @@ if errorlevel 1 (
     exit /b 1
 )
 
+REM -- Copiar la base de datos actual para probar el ejecutable con datos --
+if exist "ventas.db" (
+    copy /Y "ventas.db" "dist\ventas.db" >nul
+    echo [OK] Se copio ventas.db a dist\ para que el ejecutable use la BD actual.
+) else (
+    echo [AVISO] No se encontro ventas.db en esta carpeta. El ejecutable iniciara con una BD nueva.
+)
+
 REM -- Limpiar archivos temporales --
 echo.
 echo [3/3] Limpiando archivos temporales...

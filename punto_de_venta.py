@@ -7,7 +7,7 @@
 
 import tkinter as tk
 from tkinter import ttk, messagebox, font as tkfont
-import sqlite3, os, datetime, hashlib, csv, unicodedata
+import sqlite3, os, sys, datetime, hashlib, csv, unicodedata, threading
 
 # ── python-docx (inventario físico) — opcional ────────────
 try:
@@ -24,7 +24,19 @@ except ImportError:
 # ──────────────────────────────────────────────────────────
 #  BASE DE DATOS
 # ──────────────────────────────────────────────────────────
-DB_FILE = os.path.join(os.path.dirname(os.path.abspath(__file__)), "ventas.db")
+def _app_base_dir():
+    """Devuelve la carpeta real de trabajo de la app.
+
+    En desarrollo usamos la carpeta del .py; en PyInstaller usamos la
+    carpeta del .exe para que la BD y exportaciones vivan junto al programa.
+    """
+    if getattr(sys, "frozen", False):
+        return os.path.dirname(os.path.abspath(sys.executable))
+    return os.path.dirname(os.path.abspath(__file__))
+
+
+APP_DIR = _app_base_dir()
+DB_FILE = os.path.join(APP_DIR, "ventas.db")
 
 def get_conn():
     return sqlite3.connect(DB_FILE)
@@ -656,13 +668,35 @@ class PuntoDeVenta(tk.Tk):
         self._cliente_id_por_opcion = {"Público general": None}
         self._categorias_contables_cache = []
         self._categorias_producto_cache = []
+        self._productos_cache = []
+        self._productos_por_id = {}
+        self._productos_view_cache = []
+        self._productos_alertas_pendientes = []
+        self._productos_cargando = False
+        self._productos_filtrado_after_id = None
+        self._productos_render_after_id = None
+        self._productos_carga_token = 0
+        self._productos_render_token = 0
+        self._productos_render_batch_size = 150
+        self._productos_filtrado_debounce_ms = 120
+        self._notificaciones_inicio_after_id = None
+        self._notificaciones_inicio_habilitadas = False
+        self._notificaciones_inicio_completadas = False
+        self._entrada_busqueda = None
+        self._current_page_name = None
         self.selected_product_id = None
         self.dialog_open = False
         self.is_processing_add = False
+        self._page_builders = {
+            "ventas": self._build_page_ventas,
+            "productos": self._build_page_productos,
+            "crm": self._build_page_crm,
+            "contabilidad": self._build_page_contabilidad,
+            "historial": self._build_page_historial,
+        }
         self._build_ui()
-        self._cargar_productos()
-        self._cargar_clientes_en_venta()
-        self.after(200, self._verificar_contrasena_inicial)
+        self.after(10, self._cargar_productos)
+        self.after(800, self._cargar_clientes_en_venta)
 
     # ── UI principal ──────────────────────────────────────
     def _build_ui(self):
@@ -696,25 +730,34 @@ class PuntoDeVenta(tk.Tk):
         self.content.pack(fill="both", expand=True, padx=20, pady=(0,16))
 
         self.pages = {}
-        self._build_page_ventas()
-        self._build_page_productos()
-        self._build_page_crm()
-        self._build_page_contabilidad()
-        self._build_page_historial()
+        self._ensure_page_built("ventas")
         self._show_ventas()
 
+    def _ensure_page_built(self, name):
+        if name in self.pages:
+            return
+        builder = self._page_builders.get(name)
+        if builder is None:
+            raise KeyError(f"Página desconocida: {name}")
+        builder()
+
     def _show_page(self, name):
+        self._ensure_page_built(name)
         for p in self.pages.values():
             p.pack_forget()
         self.pages[name].pack(fill="both", expand=True)
+        self._current_page_name = name
         labels = {"ventas": "🛒  Ventas", "productos": "📦  Productos",
                   "crm": "👥  CRM", "contabilidad": "💰  Contabilidad", "historial": "📊  Historial"}
         for k, b in self.nav_btns.items():
             b.config(fg=C["accent"] if k == labels[name] else C["muted"],
                      bg=C["card"] if k == labels[name] else C["panel"])
+        if name != "ventas" and self._notificaciones_inicio_habilitadas:
+            self.after_idle(self._mostrar_notificaciones_inicio_pendientes)
 
     def _show_ventas(self):    self._show_page("ventas")
     def _show_productos(self):
+        self._ensure_page_built("productos")
         self._refrescar_categorias_producto()
         self._cargar_tabla_productos()
         self._show_page("productos")
@@ -723,12 +766,17 @@ class PuntoDeVenta(tk.Tk):
             if not cod:
                 self._autocodigo()
     def _show_crm(self):
+        self._ensure_page_built("crm")
         self._cargar_tabla_clientes()
         self._show_page("crm")
     def _show_contabilidad(self):
+        self._ensure_page_built("contabilidad")
         self._cargar_contabilidad_vista()
         self._show_page("contabilidad")
-    def _show_historial(self): self._cargar_historial(); self._show_page("historial")
+    def _show_historial(self):
+        self._ensure_page_built("historial")
+        self._cargar_historial()
+        self._show_page("historial")
 
     # ══════════════════════════════════════════════════════
     #  PÁGINA: VENTAS
@@ -754,12 +802,13 @@ class PuntoDeVenta(tk.Tk):
                  font=("Courier", 14), padx=8).pack(side="left")
 
         self.sv_busqueda = tk.StringVar()
-        self.sv_busqueda.trace_add("write", lambda *a: self._filtrar_productos())
+        self.sv_busqueda.trace_add("write", self._on_busqueda_change)
         entry = tk.Entry(inner, textvariable=self.sv_busqueda,
                          bg=C["panel"], fg=C["text"], insertbackground=C["text"],
                          bd=0, font=("Courier", 12), highlightthickness=0)
         entry.pack(side="left", fill="x", expand=True, ipady=8)
         entry.focus()
+        self._entrada_busqueda = entry
         entry.bind("<Return>", self._on_busqueda_return)
         entry.bind("<Down>", lambda e: self._focus_tabla())
 
@@ -793,6 +842,8 @@ class PuntoDeVenta(tk.Tk):
         self.tabla_busq.configure(yscrollcommand=sb.set)
         self.tabla_busq.pack(side="left", fill="both", expand=True)
         sb.pack(side="right", fill="y")
+        self.tabla_busq.tag_configure("low", foreground=C["yellow"])
+        self.tabla_busq.tag_configure("critical", foreground=C["red"])
         self.tabla_busq.bind("<<TreeviewSelect>>", self._on_tabla_busq_select)
         self.tabla_busq.bind("<Double-1>", self._on_tabla_busq_double_click)
         self.tabla_busq.bind("<Return>", self._on_tabla_busq_return)
@@ -936,6 +987,9 @@ class PuntoDeVenta(tk.Tk):
             return f"CRITICO ({dias}d)"
         return f"OK ({dias}d)"
 
+    def _on_busqueda_change(self, *_args):
+        self._programar_filtrado_productos()
+
     def _clave_prioridad_salida(self, fecha_txt, nombre):
         es_critico, dias = self._estado_caducidad(fecha_txt)
         if es_critico:
@@ -944,19 +998,16 @@ class PuntoDeVenta(tk.Tk):
             return (1, dias, nombre.lower())
         return (2, 999999, nombre.lower())
 
-    def _avisar_caducidades_criticas(self, productos):
+    def _avisar_caducidades_criticas(self, alertas):
+        if not alertas:
+            return
         criticos_nuevos = []
-        for prod in productos:
-            pid, codigo, nombre, _precio, _costo, _stock, _a_granel, caducidad, *_extra = prod
-            es_critico, dias = self._estado_caducidad(caducidad)
-            if not es_critico:
-                continue
+        for pid, codigo, nombre, dias, caducidad in alertas:
             clave_alerta = (pid, caducidad)
             if clave_alerta in self._alertas_caducidad_notificadas:
                 continue
             self._alertas_caducidad_notificadas.add(clave_alerta)
             criticos_nuevos.append((codigo, nombre, dias, caducidad))
-
         if not criticos_nuevos:
             return
 
@@ -974,6 +1025,168 @@ class PuntoDeVenta(tk.Tk):
             "y deben salir con prioridad:\n\n" + "\n".join(lineas),
             parent=self
         )
+
+    def _programar_notificaciones_inicio(self, delay_ms=2500):
+        if not self._notificaciones_inicio_habilitadas or self._notificaciones_inicio_completadas:
+            return
+        if self._notificaciones_inicio_after_id is not None:
+            self.after_cancel(self._notificaciones_inicio_after_id)
+        self._notificaciones_inicio_after_id = self.after(
+            delay_ms, self._mostrar_notificaciones_inicio_pendientes
+        )
+
+    def _mostrar_notificaciones_inicio_pendientes(self):
+        self._notificaciones_inicio_after_id = None
+        if not self._notificaciones_inicio_habilitadas or self._notificaciones_inicio_completadas:
+            return
+        if self._current_page_name == "ventas" and self.focus_get() == self._entrada_busqueda:
+            self._programar_notificaciones_inicio(delay_ms=1000)
+            return
+
+        if self._productos_alertas_pendientes:
+            alertas = self._productos_alertas_pendientes
+            self._productos_alertas_pendientes = []
+            self._avisar_caducidades_criticas(alertas)
+
+        if get_admin_hash() is None:
+            self._verificar_contrasena_inicial()
+
+        if not self._productos_alertas_pendientes and get_admin_hash() is not None:
+            self._notificaciones_inicio_completadas = True
+
+    def _construir_cache_producto_busqueda(self, rows):
+        rows_ordenados = sorted(
+            rows,
+            key=lambda p: self._clave_prioridad_salida(p[7], p[2])
+        )
+        cache_vista = []
+        alertas = []
+        for prod in rows_ordenados:
+            pid, codigo, nombre, precio, _costo, stock, a_granel, caducidad, categoria = prod
+            es_granel = bool(a_granel)
+            es_critico, dias = self._estado_caducidad(caducidad)
+            if es_critico:
+                alertas.append((pid, codigo, nombre, dias, caducidad))
+            tags = []
+            if stock <= 5:
+                tags.append("low")
+            if es_critico:
+                tags.append("critical")
+            cache_vista.append({
+                "pid": pid,
+                "codigo": codigo,
+                "nombre": nombre,
+                "precio_txt": f"${precio:.2f}",
+                "stock_txt": self._fmt_unidades(stock, es_granel, es_granel),
+                "nombre_txt": f"⚠ {nombre}" if es_critico else nombre,
+                "codigo_q": self._texto_busqueda(codigo),
+                "nombre_q": self._texto_busqueda(nombre),
+                "categoria_q": self._texto_busqueda(categoria),
+                "tags": tuple(tags),
+            })
+        return rows_ordenados, cache_vista, alertas
+
+    def _worker_cargar_productos(self, token):
+        rows = []
+        error = None
+        try:
+            with sqlite3.connect(DB_FILE) as conn:
+                rows = conn.execute(
+                    "SELECT id,codigo,nombre,precio,costo,stock,a_granel,caducidad,categoria"
+                    " FROM productos ORDER BY nombre"
+                ).fetchall()
+        except Exception as exc:
+            error = exc
+
+        if error is None:
+            rows_ordenados, cache_vista, alertas = self._construir_cache_producto_busqueda(rows)
+        else:
+            rows_ordenados, cache_vista, alertas = [], [], []
+
+        try:
+            self.after(
+                0,
+                lambda token=token, rows_ordenados=rows_ordenados, cache_vista=cache_vista,
+                       alertas=alertas, error=error: self._finalizar_carga_productos(
+                           token, rows_ordenados, cache_vista, alertas, error
+                       )
+            )
+        except tk.TclError:
+            return
+
+    def _finalizar_carga_productos(self, token, rows_ordenados, cache_vista, alertas, error):
+        if token != self._productos_carga_token:
+            return
+        self._productos_cargando = False
+        if error is not None:
+            messagebox.showerror(
+                "Error de base de datos",
+                f"No se pudieron cargar los productos.\nDetalle técnico: {error}",
+                parent=self
+            )
+            return
+
+        self._productos_cache = rows_ordenados
+        self._productos_por_id = {row[0]: row for row in rows_ordenados}
+        self._productos_view_cache = cache_vista
+        self._productos_alertas_pendientes = [
+            alerta for alerta in alertas
+            if (alerta[0], alerta[4]) not in self._alertas_caducidad_notificadas
+        ]
+        self._programar_filtrado_productos(delay_ms=0)
+        if self._productos_alertas_pendientes:
+            self._notificaciones_inicio_habilitadas = True
+            self._notificaciones_inicio_completadas = False
+            self._programar_notificaciones_inicio()
+        elif not self._notificaciones_inicio_habilitadas:
+            self._notificaciones_inicio_habilitadas = True
+            self._programar_notificaciones_inicio()
+
+    def _cancelar_render_productos(self):
+        if self._productos_render_after_id is not None:
+            self.after_cancel(self._productos_render_after_id)
+            self._productos_render_after_id = None
+
+    def _limpiar_tabla_busqueda(self):
+        children = self.tabla_busq.get_children()
+        if children:
+            self.tabla_busq.delete(*children)
+
+    def _programar_filtrado_productos(self, delay_ms=None):
+        if not hasattr(self, "tabla_busq"):
+            return
+        if self._productos_filtrado_after_id is not None:
+            self.after_cancel(self._productos_filtrado_after_id)
+        if delay_ms is None:
+            delay_ms = self._productos_filtrado_debounce_ms
+        self._productos_filtrado_after_id = self.after(delay_ms, self._filtrar_productos)
+
+    def _renderizar_lote_productos(self, token, filas, visibles, pid_seleccionado, inicio=0):
+        if token != self._productos_render_token:
+            return
+        fin = min(inicio + self._productos_render_batch_size, len(filas))
+        for fila in filas[inicio:fin]:
+            self.tabla_busq.insert(
+                "", "end",
+                values=(fila["codigo"], fila["nombre_txt"], fila["precio_txt"], fila["stock_txt"]),
+                iid=str(fila["pid"]),
+                tags=fila["tags"],
+            )
+        if fin < len(filas):
+            self._productos_render_after_id = self.after(
+                1,
+                lambda token=token, filas=filas, visibles=visibles,
+                       pid_seleccionado=pid_seleccionado, fin=fin: self._renderizar_lote_productos(
+                           token, filas, visibles, pid_seleccionado, fin
+                       )
+            )
+            return
+
+        self._productos_render_after_id = None
+        if pid_seleccionado in visibles:
+            self._seleccionar_producto_en_tabla(pid_seleccionado)
+        else:
+            self.selected_product_id = None
 
     def _pedir_cantidad_granel(self, nombre, precio, stock_disponible):
         dlg = tk.Toplevel(self)
@@ -1103,7 +1316,7 @@ class PuntoDeVenta(tk.Tk):
         return resultado["cantidad"]
 
     def _buscar_producto_por_id(self, pid):
-        return next((p for p in self._productos_cache if p[0] == pid), None)
+        return self._productos_por_id.get(pid)
 
     def _obtener_item_carrito(self, pid):
         return next((item for item in self.carrito if item["id"] == pid), None)
@@ -1290,49 +1503,34 @@ class PuntoDeVenta(tk.Tk):
 
     # ── Lógica de búsqueda ────────────────────────────────
     def _cargar_productos(self):
-        self._productos_cache = []
-        with get_conn() as conn:
-            rows = conn.execute(
-                "SELECT id,codigo,nombre,precio,costo,stock,a_granel,caducidad,categoria"
-                " FROM productos ORDER BY nombre"
-            ).fetchall()
-        self._productos_cache = sorted(
-            rows,
-            key=lambda p: self._clave_prioridad_salida(p[7], p[2])
+        self._productos_cargando = True
+        self._productos_carga_token += 1
+        token = self._productos_carga_token
+        worker = threading.Thread(
+            target=self._worker_cargar_productos,
+            args=(token,),
+            name=f"cargar-productos-{token}",
+            daemon=True,
         )
-        self._avisar_caducidades_criticas(self._productos_cache)
-        self._filtrar_productos()
+        worker.start()
 
     def _filtrar_productos(self):
+        self._productos_filtrado_after_id = None
         q = self._texto_busqueda(self.sv_busqueda.get())
         pid_seleccionado = self._obtener_pid_seleccionado()
-        for row in self.tabla_busq.get_children():
-            self.tabla_busq.delete(row)
-        visibles = set()
-        for prod in self._productos_cache:
-            pid, codigo, nombre, precio, costo, stock, a_granel, caducidad, categoria = prod
-            codigo_q = self._texto_busqueda(codigo)
-            nombre_q = self._texto_busqueda(nombre)
-            categoria_q = self._texto_busqueda(categoria)
-            if q in codigo_q or q in nombre_q or q in categoria_q:
-                es_critico, _dias = self._estado_caducidad(caducidad)
-                tags = []
-                if stock <= 5:
-                    tags.append("low")
-                if es_critico:
-                    tags.append("critical")
-                stock_txt = self._fmt_unidades(stock, bool(a_granel), bool(a_granel))
-                nombre_txt = f"⚠ {nombre}" if es_critico else nombre
-                visibles.add(pid)
-                self.tabla_busq.insert("", "end",
-                    values=(codigo, nombre_txt, f"${precio:.2f}", stock_txt),
-                    iid=str(pid), tags=tuple(tags))
-        self.tabla_busq.tag_configure("low", foreground=C["yellow"])
-        self.tabla_busq.tag_configure("critical", foreground=C["red"])
-        if pid_seleccionado in visibles:
-            self._seleccionar_producto_en_tabla(pid_seleccionado)
-        else:
+        filas = [
+            fila for fila in self._productos_view_cache
+            if q in fila["codigo_q"] or q in fila["nombre_q"] or q in fila["categoria_q"]
+        ]
+        visibles = {fila["pid"] for fila in filas}
+        self._productos_render_token += 1
+        token = self._productos_render_token
+        self._cancelar_render_productos()
+        self._limpiar_tabla_busqueda()
+        if not filas:
             self.selected_product_id = None
+            return
+        self._renderizar_lote_productos(token, filas, visibles, pid_seleccionado, 0)
 
     def _focus_tabla(self):
         children = self.tabla_busq.get_children()
@@ -3176,7 +3374,7 @@ class PuntoDeVenta(tk.Tk):
                 "No hay productos registrados en la base de datos.", parent=self)
             return
         # Capa 3: crear carpeta
-        base = os.path.dirname(os.path.abspath(__file__))
+        base = APP_DIR
         carpeta = os.path.join(base, "documentos para inventarios fisicos")
         try:
             os.makedirs(carpeta, exist_ok=True)
@@ -3615,8 +3813,6 @@ class PuntoDeVenta(tk.Tk):
         self.tabla_conta.tag_configure("ing", foreground=C["green"])
         self.tabla_conta.tag_configure("egr", foreground=C["red"])
 
-        self._cargar_contabilidad_vista()
-
     def _conta_set_hoy(self):
         hoy = datetime.date.today().isoformat()
         if hasattr(self, "sv_conta_ini"):
@@ -3900,7 +4096,7 @@ class PuntoDeVenta(tk.Tk):
             messagebox.showerror("Fechas inválidas", str(e), parent=self)
             return
 
-        base = os.path.dirname(os.path.abspath(__file__))
+        base = APP_DIR
         carpeta = os.path.join(base, "respaldos_csv", "contabilidad")
         os.makedirs(carpeta, exist_ok=True)
         ts = datetime.datetime.now().strftime("%Y%m%d_%H%M%S")
@@ -3925,7 +4121,7 @@ class PuntoDeVenta(tk.Tk):
             messagebox.showerror("Fechas inválidas", str(e), parent=self)
             return
 
-        base = os.path.dirname(os.path.abspath(__file__))
+        base = APP_DIR
         carpeta = os.path.join(base, "respaldos_csv", "contabilidad")
         os.makedirs(carpeta, exist_ok=True)
         ts = datetime.datetime.now().strftime("%Y%m%d_%H%M%S")
@@ -3955,7 +4151,7 @@ class PuntoDeVenta(tk.Tk):
             messagebox.showerror("Fechas inválidas", str(e), parent=self)
             return
 
-        base = os.path.dirname(os.path.abspath(__file__))
+        base = APP_DIR
         carpeta = os.path.join(base, "respaldos_csv", "contabilidad")
         os.makedirs(carpeta, exist_ok=True)
         ts = datetime.datetime.now().strftime("%Y%m%d_%H%M%S")
@@ -4130,7 +4326,7 @@ class PuntoDeVenta(tk.Tk):
                 values=(r[0],cant_txt,f"${r[2]:.2f}",f"${r[3]:.2f}",f"${r[4]:.2f}"))
 
     def _exportar_csv(self):
-        carpeta_base = os.path.dirname(os.path.abspath(__file__))
+        carpeta_base = APP_DIR
         carpeta_respaldos = os.path.join(carpeta_base, "respaldos_csv")
         os.makedirs(carpeta_respaldos, exist_ok=True)
         fecha_str = datetime.datetime.now().strftime("%Y%m%d_%H%M%S")
