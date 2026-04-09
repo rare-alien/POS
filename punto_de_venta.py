@@ -4709,5 +4709,168 @@ class PuntoDeVenta(tk.Tk):
 
 # ──────────────────────────────────────────────────────────
 if __name__ == "__main__":
+    # Soporte CLI ligero para análisis fuera de la UI
+    def _calculos_financieros_desde_csv(ruta_csv, valor_inventario=None, costos_fijos_mensuales=26800.0, exportar_ruta=None):
+        """Lee un historial de ventas CSV y devuelve un análisis financiero útil para Power BI.
+
+        - Calcula margen promedio, ventas necesarias (punto de equilibrio) y ventas diarias necesarias.
+        - Ejecuta análisis ABC por `Producto` usando la ganancia como criterio.
+        - Calcula costo unitario promedio (Subtotal - Ganancia) / Cantidad y sugiere precios.
+
+        Parámetros:
+        - ruta_csv: ruta al CSV con columnas: Producto, Cantidad, Subtotal_Producto, Ganancia_Producto, Precio_Unitario
+        - valor_inventario: valor total del inventario a costo (float). Si None, usa 56572.45.
+        - costos_fijos_mensuales: monto fijo mensual (float).
+        - exportar_ruta: ruta para escribir el CSV resultante (si None, escribe junto al CSV original).
+
+        Retorna: dict con resumen y `df_productos` (pandas.DataFrame) si pandas está disponible.
+        """
+        try:
+            import pandas as pd
+        except Exception as e:
+            raise RuntimeError("Esta función requiere pandas. Instala con: pip install pandas") from e
+
+        if valor_inventario is None:
+            valor_inventario = 56572.45
+
+        df = pd.read_csv(ruta_csv, encoding="utf-8")
+
+        # Normalizar nombres de columnas (por si acaso)
+        df.columns = [c.strip() for c in df.columns]
+        # Asegurar tipos numéricos
+        for col in ("Cantidad", "Subtotal_Producto", "Ganancia_Producto", "Precio_Unitario"):
+            if col in df.columns:
+                df[col] = pd.to_numeric(df[col], errors="coerce").fillna(0)
+
+        df["Costo_Total"] = df.get("Subtotal_Producto", 0) - df.get("Ganancia_Producto", 0)
+        # Evitar división por cero
+        df["Costo_Unitario_Estimado"] = df.apply(
+            lambda r: (r["Costo_Total"] / r["Cantidad"]) if (r.get("Cantidad", 0) and r.get("Cantidad", 0) != 0) else None,
+            axis=1
+        )
+
+        total_subtotal = float(df.get("Subtotal_Producto", pd.Series(dtype=float)).sum() or 0.0)
+        total_ganancia = float(df.get("Ganancia_Producto", pd.Series(dtype=float)).sum() or 0.0)
+        margen_promedio = (total_ganancia / total_subtotal) if total_subtotal > 0 else 0.0
+
+        ventas_necesarias = None
+        ventas_diarias = None
+        if margen_promedio > 0:
+            ventas_necesarias = float(costos_fijos_mensuales) / float(margen_promedio)
+            ventas_diarias = ventas_necesarias / 30.0
+
+        # Agrupar por producto
+        grupo = df.groupby("Producto").agg(
+            cantidad_total=("Cantidad", "sum"),
+            subtotal_total=("Subtotal_Producto", "sum"),
+            ganancia_total=("Ganancia_Producto", "sum"),
+            costo_total=("Costo_Total", "sum")
+        ).reset_index()
+
+        # Costo unitario promedio por producto
+        grupo["costo_unitario_prom"] = grupo.apply(
+            lambda r: (r["costo_total"] / r["cantidad_total"]) if (r["cantidad_total"] and r["cantidad_total"] != 0) else 0.0,
+            axis=1
+        )
+
+        # ABC por ganancia
+        grupo = grupo.sort_values(by="ganancia_total", ascending=False)
+        total_ganancia_prod = grupo["ganancia_total"].sum()
+        if total_ganancia_prod == 0:
+            grupo["pct_acum"] = 0
+        else:
+            grupo["ganancia_acum"] = grupo["ganancia_total"].cumsum()
+            grupo["pct_acum"] = grupo["ganancia_acum"] / total_ganancia_prod
+
+        def _clas(p):
+            if p <= 0.80:
+                return "A"
+            if p <= 0.95:
+                return "B"
+            return "C"
+
+        grupo["clasificacion_abc"] = grupo["pct_acum"].apply(_clas)
+
+        # Factor de costos fijos
+        factor = float(costos_fijos_mensuales) / float(valor_inventario) if valor_inventario and valor_inventario != 0 else 0.0
+
+        # Márgenes por clase (valores sugeridos — ajustables)
+        mapping_margen = {"A": 0.30, "B": 0.45, "C": 0.70}
+        grupo["margen_sugerido"] = grupo["clasificacion_abc"].map(mapping_margen)
+
+        # Precio sugerido aplicando factor de costos fijos + margen
+        grupo["precio_sugerido"] = grupo.apply(
+            lambda r: round(r["costo_unitario_prom"] * (1 + factor) * (1 + r["margen_sugerido"]), 2),
+            axis=1
+        )
+
+        # Rutas de exportación
+        if exportar_ruta is None:
+            base = os.path.dirname(ruta_csv)
+            nombre = os.path.splitext(os.path.basename(ruta_csv))[0]
+            exportar_ruta = os.path.join(base, f"analisis_abc_precios_{nombre}.csv")
+
+        grupo.to_csv(exportar_ruta, index=False, encoding="utf-8")
+
+        resumen = {
+            "costos_fijos_mensuales": float(costos_fijos_mensuales),
+            "valor_total_inventario": float(valor_inventario),
+            "factor_costos_fijos": float(factor),
+            "margen_promedio": float(margen_promedio),
+            "ventas_necesarias": float(ventas_necesarias) if ventas_necesarias is not None else None,
+            "ventas_diarias": float(ventas_diarias) if ventas_diarias is not None else None,
+            "total_subtotal": float(total_subtotal),
+            "total_ganancia": float(total_ganancia),
+            "archivo_exportado": exportar_ruta,
+        }
+
+        return resumen, grupo
+
+    def _imprimir_dax_ejemplo(costos_fijos=26800):
+        dax = []
+        dax.append(f"-- Ventas necesarias (punto de equilibrio)\nVentasNecesarias = {costos_fijos} / [Margen Promedio]")
+        dax.append("\n-- Margen promedio\nMargen% = DIVIDE(SUM(DetalleVenta[Ganancia_Producto]), SUM(DetalleVenta[Subtotal_Producto]))")
+        dax.append("\n-- Utilidad neta (restar costos fijos)\nUtilidadNeta = SUM(DetalleVenta[Ganancia_Producto]) - " + str(costos_fijos))
+        return "\n\n".join(dax)
+
+    # CLI: --analizar <csv> [--inventario VALOR] [--export PATH]
+    if len(sys.argv) > 1 and sys.argv[1] == "--analizar":
+        ruta = sys.argv[2] if len(sys.argv) > 2 else None
+        if not ruta or not os.path.exists(ruta):
+            print("Uso: python punto_de_venta.py --analizar <ruta_csv> [--inventario VALOR] [--export RUTA]")
+            sys.exit(1)
+        valor_inv = None
+        export_ruta = None
+        # parse opcionales
+        i = 3
+        while i < len(sys.argv):
+            a = sys.argv[i]
+            if a == "--inventario" and i + 1 < len(sys.argv):
+                try:
+                    valor_inv = float(sys.argv[i + 1])
+                except Exception:
+                    valor_inv = None
+                i += 2
+                continue
+            if a == "--export" and i + 1 < len(sys.argv):
+                export_ruta = sys.argv[i + 1]
+                i += 2
+                continue
+            i += 1
+
+        try:
+            resumen, dfp = _calculos_financieros_desde_csv(ruta, valor_inventario=valor_inv)
+        except Exception as e:
+            print("Error durante el análisis:", e)
+            sys.exit(2)
+
+        print("Resumen:")
+        for k, v in resumen.items():
+            print(f" - {k}: {v}")
+        print('\nArchivo exportado con detalle por producto:', resumen.get('archivo_exportado'))
+        print('\nMedidas DAX sugeridas:\n')
+        print(_imprimir_dax_ejemplo(resumen.get('costos_fijos_mensuales', 26800)))
+        sys.exit(0)
+
     app = PuntoDeVenta()
     app.mainloop()
