@@ -6,7 +6,7 @@
 """
 
 import tkinter as tk
-from tkinter import ttk, messagebox, font as tkfont
+from tkinter import ttk, messagebox, simpledialog
 import sqlite3, os, sys, datetime, hashlib, csv, unicodedata, threading
 
 # ── python-docx (inventario físico) — opcional ────────────
@@ -722,6 +722,13 @@ class PuntoDeVenta(tk.Tk):
                           activeforeground=C["text"], command=cmd)
             b.pack(side="left", padx=3)
             self.nav_btns[label] = b
+
+        # Botón siempre visible para análisis ABC (acceso rápido)
+        b_abc = tk.Button(nav_frame, text="📈  Análisis ABC", bg=C["panel"], fg=C["muted"],
+                  bd=0, padx=12, pady=6, cursor="hand2",
+                  font=("Courier", 10), activebackground=C["hover"],
+                  command=lambda: self._ui_ejecutar_analisis_abc())
+        b_abc.pack(side="left", padx=6)
 
         sep = tk.Frame(self, bg=C["border"], height=1)
         sep.pack(fill="x", padx=20, pady=10)
@@ -4250,7 +4257,13 @@ class PuntoDeVenta(tk.Tk):
             self.tabla_det.heading(c, text=h, anchor="center")
             self.tabla_det.column(c, width=w, anchor="center", stretch=False)
         self.tabla_det.pack(fill="both", expand=True)
-
+        
+        # Botón para ejecutar análisis ABC y guardar archivo
+        tk.Button(right_h, text="📊  Análisis ABC y guardar",
+              bg=C["accent"], fg=C["white"], bd=0,
+              font=("Courier", 10, "bold"), padx=12, pady=6, cursor="hand2",
+              activebackground="#3a7de0",
+              command=self._ui_ejecutar_analisis_abc).pack(fill="x", pady=(8,0))
         def _block_resize(event, tv):
             if tv.identify_region(event.x, event.y) == "separator":
                 return "break"
@@ -4372,6 +4385,77 @@ class PuntoDeVenta(tk.Tk):
                 f"Ocurrió un problema al exportar el archivo CSV:\n{str(e)}",
                 parent=self
             )
+
+    def _exportar_historial_csv_silent(self):
+        """Exporta el historial de ventas a CSV sin diálogos y devuelve la ruta creada."""
+        carpeta_base = APP_DIR
+        carpeta_respaldos = os.path.join(carpeta_base, "respaldos_csv")
+        os.makedirs(carpeta_respaldos, exist_ok=True)
+        fecha_str = datetime.datetime.now().strftime("%Y%m%d_%H%M%S")
+        nombre_archivo = f"historial_ventas_{fecha_str}.csv"
+        ruta_completa = os.path.join(carpeta_respaldos, nombre_archivo)
+        with get_conn() as conn:
+            cursor = conn.cursor()
+            cursor.execute("""
+                SELECT v.id, v.fecha, IFNULL(c.nombre,'Público general') AS cliente, v.total,
+                       dv.nombre, dv.cantidad, dv.precio, dv.subtotal, dv.ganancia
+                FROM ventas v
+                LEFT JOIN clientes c ON c.id = v.cliente_id
+                LEFT JOIN detalle_venta dv ON v.id = dv.venta_id
+                ORDER BY v.id DESC
+            """)
+            filas = cursor.fetchall()
+        filas_csv = []
+        venta_ids_exportadas = set()
+        for fila in filas:
+            fila = list(fila)
+            venta_id = fila[0]
+            if venta_id in venta_ids_exportadas:
+                fila[3] = ""
+            else:
+                venta_ids_exportadas.add(venta_id)
+            filas_csv.append(fila)
+        with open(ruta_completa, mode="w", newline="", encoding="utf-8") as archivo_csv:
+            escritor = csv.writer(archivo_csv)
+            escritor.writerow([
+                "ID_Venta", "Fecha_Venta", "Cliente", "Total_Venta",
+                "Producto", "Cantidad", "Precio_Unitario", "Subtotal_Producto", "Ganancia_Producto"
+            ])
+            escritor.writerows(filas_csv)
+        return ruta_completa
+
+    def _ui_ejecutar_analisis_abc(self):
+        """Exporta historial, ejecuta análisis ABC y muestra resultado; guarda CSV de análisis."""
+        try:
+            ruta_hist = self._exportar_historial_csv_silent()
+        except Exception as e:
+            messagebox.showerror("Error", f"No se pudo exportar historial:\n{e}", parent=self)
+            return
+
+        # Pedir valor del inventario (puede cancelarse)
+        try:
+            valor_inv = simpledialog.askfloat(
+                "Valor inventario",
+                "Introduce el valor total del inventario a costo (dejar vacío usa valor por defecto):",
+                parent=self,
+                minvalue=0.0
+            )
+        except Exception:
+            valor_inv = None
+
+        try:
+            resumen, dfp = _calculos_financieros_desde_csv(ruta_hist, valor_inventario=valor_inv)
+        except Exception as e:
+            messagebox.showerror("Error análisis", f"Ocurrió un error en el análisis:\n{e}", parent=self)
+            return
+
+        txt = (
+            f"Análisis ABC completado.\n\nArchivo exportado:\n{resumen.get('archivo_exportado')}\n\n"
+            f"Ventas necesarias (mensual): {resumen.get('ventas_necesarias')}\n"
+            f"Ventas diarias: {resumen.get('ventas_diarias')}\n"
+            f"Margen promedio: {resumen.get('margen_promedio')}\n"
+        )
+        messagebox.showinfo("✔ Análisis ABC", txt, parent=self)
 
     # ══════════════════════════════════════════════════════
     #  GESTIÓN DE CONTRASEÑA DE ADMINISTRADOR
