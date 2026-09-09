@@ -8,6 +8,9 @@
 import tkinter as tk
 from tkinter import ttk, messagebox, simpledialog
 import sqlite3, os, sys, datetime, hashlib, csv, unicodedata, threading
+from decimal import Decimal, ROUND_HALF_UP
+
+import repositorio_pos
 
 # ── python-docx (inventario físico) — opcional ────────────
 try:
@@ -39,7 +42,7 @@ APP_DIR = _app_base_dir()
 DB_FILE = os.path.join(APP_DIR, "ventas.db")
 
 def get_conn():
-    return sqlite3.connect(DB_FILE)
+    return repositorio_pos.connect(DB_FILE)
 
 def _hash(texto):
     """Devuelve el SHA-256 hexadecimal de un texto. Único punto de hashing en todo el sistema."""
@@ -47,19 +50,11 @@ def _hash(texto):
 
 def get_admin_hash():
     """Lee el hash de contraseña guardado en BD. Retorna None si aún no se ha creado."""
-    with get_conn() as conn:
-        row = conn.execute(
-            "SELECT valor FROM configuracion WHERE clave = 'admin_hash'"
-        ).fetchone()
-    return row[0] if row else None
+    return repositorio_pos.leer_admin_hash(DB_FILE)
 
 def set_admin_hash(nuevo_hash):
     """Guarda o actualiza el hash en BD (INSERT OR REPLACE)."""
-    with get_conn() as conn:
-        conn.execute(
-            "INSERT OR REPLACE INTO configuracion (clave, valor) VALUES ('admin_hash', ?)",
-            (nuevo_hash,)
-        )
+    repositorio_pos.guardar_admin_hash(nuevo_hash, DB_FILE)
 
 def init_db():
     conn = get_conn()
@@ -635,19 +630,21 @@ def generar_docx_inventario(productos, ruta_salida):
 #  COLORES Y ESTILO
 # ──────────────────────────────────────────────────────────
 C = {
-    "bg":        "#4CBB17",
-    "panel":     "#ffffff",
-    "card":      "#ffffff",
-    "border":    "#e6f3e8",
-    "accent":    "#48872B",
-    "accent2":   "#39542C",
-    "green":     "#293325",
-    "red":       "#e74c3c",
-    "yellow":    "#f39c12",
-    "text":      "#062b00",
-    "muted":     "#6b786e",
-    "white":     "#ffffff",
-    "hover":     "#a8e39a",
+    "bg":        "#F7FAF7",
+    "panel":     "#FFFFFF",
+    "card":      "#FFFFFF",
+    "border":    "#B9C4B9",
+    "accent":    "#1B5E20",
+    "accent2":   "#2E7D32",
+    "green":     "#2E7D32",
+    "red":       "#C62828",
+    "yellow":    "#F9A825",
+    "text":      "#111111",
+    "muted":     "#37474F",
+    "white":     "#FFFFFF",
+    "hover":     "#C8E6C9",
+    "warn_bg":   "#FFF176",
+    "crit_bg":   "#EF5350",
 }
 
 # ──────────────────────────────────────────────────────────
@@ -849,8 +846,8 @@ class PuntoDeVenta(tk.Tk):
         self.tabla_busq.configure(yscrollcommand=sb.set)
         self.tabla_busq.pack(side="left", fill="both", expand=True)
         sb.pack(side="right", fill="y")
-        self.tabla_busq.tag_configure("low", foreground=C["yellow"])
-        self.tabla_busq.tag_configure("critical", foreground=C["red"])
+        self.tabla_busq.tag_configure("low", background=C["warn_bg"], foreground="#000000")
+        self.tabla_busq.tag_configure("critical", background=C["crit_bg"], foreground="#FFFFFF")
         self.tabla_busq.bind("<<TreeviewSelect>>", self._on_tabla_busq_select)
         self.tabla_busq.bind("<Double-1>", self._on_tabla_busq_double_click)
         self.tabla_busq.bind("<Return>", self._on_tabla_busq_return)
@@ -944,7 +941,7 @@ class PuntoDeVenta(tk.Tk):
         btn_quitar.pack(fill="x", pady=(10,4))
 
         btn_limpiar = tk.Button(right, text="⟳  Limpiar carrito",
-                                bg=C["card"], fg=C["yellow"], bd=0,
+                                bg=C["card"], fg=C["accent2"], bd=0,
                                 font=("Courier", 10), pady=8, cursor="hand2",
                                 activebackground=C["hover"],
                                 command=self._limpiar_carrito)
@@ -959,15 +956,17 @@ class PuntoDeVenta(tk.Tk):
 
     def _fmt_unidades(self, valor, es_granel=False, con_unidad=False):
         try:
-            num = float(valor)
-        except (TypeError, ValueError):
+            num = valor if isinstance(valor, Decimal) else Decimal(str(valor))
+        except Exception:
             return "0"
         if es_granel:
-            txt = f"{num:.3f}".rstrip("0").rstrip(".")
+            txt = format(
+                num.quantize(Decimal("0.001"), rounding=ROUND_HALF_UP), "f"
+            ).rstrip("0").rstrip(".")
             if not txt:
                 txt = "0"
             return f"{txt} kg" if con_unidad else txt
-        return str(int(round(num)))
+        return str(int(num.to_integral_value(rounding=ROUND_HALF_UP)))
 
     def _texto_busqueda(self, texto):
         base = (texto or "").strip().lower()
@@ -1225,34 +1224,47 @@ class PuntoDeVenta(tk.Tk):
         syncing = {"on": False}
         resultado = {"cantidad": None}
 
-        def _parse_float(texto):
+        def _parse_dec(texto):
             t = texto.strip().replace(",", ".")
             if not t:
                 return None
             try:
-                return float(t)
-            except ValueError:
+                return Decimal(t)
+            except Exception:
                 return None
+
+        def _fmt_cantidad(num):
+            txt = format(
+                num.quantize(Decimal("0.001"), rounding=ROUND_HALF_UP), "f"
+            ).rstrip("0").rstrip(".")
+            return txt if txt else "0"
+
+        precio_dec = Decimal(str(precio))
 
         def _set_importe(*_):
             if syncing["on"]:
                 return
-            cantidad = _parse_float(sv_cantidad.get())
+            cantidad = _parse_dec(sv_cantidad.get())
             if cantidad is None:
                 return
+            importe = (cantidad * precio_dec).quantize(
+                Decimal("0.01"), rounding=ROUND_HALF_UP
+            )
             syncing["on"] = True
-            sv_importe.set(f"{cantidad * precio:.2f}")
+            sv_importe.set(f"{importe:.2f}")
             syncing["on"] = False
 
         def _set_cantidad(*_):
-            if syncing["on"] or precio <= 0:
+            if syncing["on"] or precio_dec <= 0:
                 return
-            importe = _parse_float(sv_importe.get())
+            importe = _parse_dec(sv_importe.get())
             if importe is None:
                 return
-            cantidad = round(importe / precio, 3)
+            cantidad = (importe / precio_dec).quantize(
+                Decimal("0.001"), rounding=ROUND_HALF_UP
+            )
             syncing["on"] = True
-            sv_cantidad.set(self._fmt_unidades(cantidad, True))
+            sv_cantidad.set(_fmt_cantidad(cantidad))
             syncing["on"] = False
 
         tk.Label(body, text="Cantidad vendida (kg)", fg=C["muted"], bg=C["card"],
@@ -1282,16 +1294,18 @@ class PuntoDeVenta(tk.Tk):
         lbl_error.pack(pady=(8, 4))
 
         def _confirmar():
-            cantidad = _parse_float(sv_cantidad.get())
+            cantidad = _parse_dec(sv_cantidad.get())
             if cantidad is None or cantidad <= 0:
                 lbl_error.config(text="Ingresa una cantidad válida mayor a 0.")
                 return
-            if cantidad > stock_disponible + 1e-9:
+            if cantidad > Decimal(str(stock_disponible)) + Decimal("0.0000001"):
                 lbl_error.config(
                     text=f"Stock insuficiente. Máximo: {self._fmt_unidades(stock_disponible, True, True)}"
                 )
                 return
-            resultado["cantidad"] = round(cantidad, 3)
+            resultado["cantidad"] = float(
+                cantidad.quantize(Decimal("0.001"), rounding=ROUND_HALF_UP)
+            )
             dlg.destroy()
 
         def _cancelar():
@@ -1591,7 +1605,14 @@ class PuntoDeVenta(tk.Tk):
             messagebox.showinfo("Carrito vacío", "Agrega productos antes de cobrar.",
                                 parent=self)
             return
-        total = sum(i["precio"] * i["cantidad"] for i in self.carrito)
+        total = float(
+            sum(
+                (Decimal(str(i["precio"])) * Decimal(str(i["cantidad"]))).quantize(
+                    Decimal("0.01"), rounding=ROUND_HALF_UP
+                )
+                for i in self.carrito
+            )
+        )
         confirm = messagebox.askyesno("Confirmar venta",
             f"¿Registrar venta por ${total:.2f}?", parent=self)
         if not confirm:
@@ -1612,7 +1633,11 @@ class PuntoDeVenta(tk.Tk):
             for item in self.carrito:
                 cantidad_vendida = float(item["cantidad"])
                 es_granel = bool(item.get("es_granel", False))
-                sub = item["precio"] * cantidad_vendida
+                sub = float(
+                    (Decimal(str(item["precio"])) * Decimal(str(cantidad_vendida))).quantize(
+                        Decimal("0.01"), rounding=ROUND_HALF_UP
+                    )
+                )
                 row_stock = conn.execute(
                     "SELECT stock FROM productos WHERE id = ?",
                     (item["id"],)
@@ -2485,7 +2510,7 @@ class PuntoDeVenta(tk.Tk):
         self.sv_categoria_producto = tk.StringVar(value="")
         self._refrescar_categorias_producto()
         for col, (lbl, key) in enumerate(fields):
-            color_lbl = C["yellow"] if key == "e_costo" else C["muted"]
+            color_lbl = C["accent"] if key == "e_costo" else C["muted"]
             tk.Label(form_card, text=lbl, fg=color_lbl, bg=C["card"],
                      font=("Courier", 9)).grid(row=1, column=col, padx=(0,4), sticky="w")
 
@@ -2585,7 +2610,7 @@ class PuntoDeVenta(tk.Tk):
         tk.Button(btn_frame, text="＋ Guardar", bg=C["accent"], fg=C["white"],
               bd=0, font=("Courier", 10, "bold"), padx=12, pady=6, cursor="hand2",
               command=self._guardar_producto).pack(side="left", padx=(0,4))
-        tk.Button(btn_frame, text="➖ Descontar stock", bg=C["yellow"], fg=C["bg"],
+        tk.Button(btn_frame, text="➖ Descontar stock", bg=C["yellow"], fg="#000000",
               bd=0, font=("Courier", 10, "bold"), padx=12, pady=6, cursor="hand2",
               activebackground="#d4a514",
               command=self._descontar_stock_producto).pack(side="left", padx=(0,4))
@@ -2672,8 +2697,8 @@ class PuntoDeVenta(tk.Tk):
                         stock_txt, r[6], r[8] or "-", "Sí" if r[7] else "No", estado
                     ),
                     iid=str(r[0]), tags=tuple(tags))
-        self.tabla_prod.tag_configure("low", foreground=C["yellow"])
-        self.tabla_prod.tag_configure("critical", foreground=C["red"])
+        self.tabla_prod.tag_configure("low", background=C["warn_bg"], foreground="#000000")
+        self.tabla_prod.tag_configure("critical", background=C["crit_bg"], foreground="#FFFFFF")
 
     def _llenar_form_producto(self, event=None):
         sel = self.tabla_prod.selection()
@@ -2738,7 +2763,7 @@ class PuntoDeVenta(tk.Tk):
         dlg.resizable(False, False)
         dlg.transient(self)
 
-        tk.Label(dlg, text="DESCONTAR INVENTARIO", fg=C["yellow"], bg=C["card"],
+        tk.Label(dlg, text="DESCONTAR INVENTARIO", fg=C["accent"], bg=C["card"],
                  font=("Courier", 12, "bold")).pack(pady=(16, 4))
         tk.Label(dlg, text=f"{codigo} | {nombre}", fg=C["text"], bg=C["card"],
                  font=("Courier", 10, "bold"), wraplength=420,
@@ -2907,7 +2932,7 @@ class PuntoDeVenta(tk.Tk):
 
         btns = tk.Frame(dlg, bg=C["card"])
         btns.pack(fill="x", padx=20, pady=(8, 12))
-        tk.Button(btns, text="✔ Aplicar", bg=C["yellow"], fg=C["bg"], bd=0,
+        tk.Button(btns, text="✔ Aplicar", bg=C["yellow"], fg="#000000", bd=0,
                   font=("Courier", 10, "bold"), pady=8, cursor="hand2",
                   activebackground="#d4a514",
                   command=_confirmar).pack(side="left", fill="x", expand=True, padx=(0, 4))
@@ -4215,7 +4240,7 @@ class PuntoDeVenta(tk.Tk):
         self.kpi_frame.pack(fill="x", pady=(0,10))
         self.kpi_ventas   = self._kpi_box(self.kpi_frame, "VENTAS HOY",   "0",      C["accent"])
         self.kpi_total    = self._kpi_box(self.kpi_frame, "TOTAL HOY",    "$0.00",  C["green"])
-        self.kpi_ganancia = self._kpi_box(self.kpi_frame, "GANANCIA HOY", "$0.00",  C["yellow"])
+        self.kpi_ganancia = self._kpi_box(self.kpi_frame, "GANANCIA HOY", "$0.00",  "#B26A00")
 
         cols_v = ("id","fecha","cliente","total")
         fr1 = tk.Frame(page, bg=C["bg"])
@@ -4734,7 +4759,7 @@ class PuntoDeVenta(tk.Tk):
             if intento > 1:
                 tk.Label(dlg,
                          text=f"✕ Contraseña incorrecta — intento {intento} de {MAX_INTENTOS}",
-                         fg=C["yellow"], bg=C["card"],
+                         fg=C["red"], bg=C["card"],
                          font=("Courier", 9)).pack(pady=(0,4))
             tk.Label(dlg, text="Ingresa la contraseña de administrador:",
                      fg=C["text"], bg=C["card"],
